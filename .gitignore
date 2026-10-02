@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets -- never commit real keys
+.env
+.env.*
+!.env.example
+
+# Machine-specific: records absolute paths to the relocated build tooling
+.tools_locator.json
+
+# Build tooling (sbt / JDK / figure-extractor); recreated by scripts/setup_deps.sh
+tools/
+
+# NOTE: gitignore has no trailing comments -- `foo/  # bar` is a literal pattern
+# that matches nothing. Keep explanations on their own line.
+
+# Generated output. Recreate with: python -m src.pipeline.run --pdf <pdf>
+data/vector_db/
+data/extracted/
+data/processed/
+
+# Source codebooks. Never commit these: they are third-party publications under
+# copyright (IS 456 is a Bureau of Indian Standards publication), and the
+# extracted JSONL under data/ reproduces their text verbatim.
+data/raw/*.pdf
+
+# Fixture PDFs are regenerable: python fixtures/make_fixture.py
+fixtures/*.pdf

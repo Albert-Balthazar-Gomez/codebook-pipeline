@@ -1,0 +1,24 @@
+# Eurocode (EN 1990-1999). Numbering is EN-clause style: 3.1.1(2), with
+# parenthesised sub-clauses for list items.
+#
+# Single-quoted YAML: one backslash, not two. Python `re` does the interpreting.
+standard: Eurocode
+codebook_slug_pattern: 'en\s*199\d'
+
+clause:
+  pattern: '^\s*§?\s*(?P<number>\d+(?:\.\d+){1,4}(?:\(\d+\))?)\s*\.?\s+'
+  pattern_number_only: '^\s*§?\s*(?P<number>\d+(?:\.\d+){1,4}(?:\(\d+\))?)\s*\.?\s*$'
+  max_depth: 4
+  # Eurocode parts use sections 1-9; parenthesised sub-clauses are separate.
+  max_number: 30
+  reference_pattern: '\b(?:cl\.?|clause|sub-?clause)\s*(\d+(?:\.\d+){1,4})\b'
+
+annex:
+  pattern: '^\s*(?:annex|ANNEX)\s+([A-Z]{1,2})\b'
+
+heading:
+  font_size_advantage: 0.5
+
+caption:
+  figure_pattern: '(?i)^\s*(?:fig(?:ure)?\.?\s*[-–—]?\s*[A-Z]?\d+(?:\.\d+)*)'
+  table_pattern: '(?i)^\s*(?:table\s*[-–—]?\s*[A-Z]?\d+(?:\.\d+)*)'
