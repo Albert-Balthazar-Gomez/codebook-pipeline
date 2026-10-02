@@ -1,0 +1,38 @@
+# IS 456 (Indian Standard, Plain and Reinforced Concrete).
+#
+# Clause numbering is purely decimal, 1 to 4 levels deep. Clause numbers are
+# rendered with a period and a trailing space ("26.5.1.1") or with a space and a
+# period ("26.5.1.1."), and headings are often set in bold on their own line.
+#
+# NOTE: these are single-quoted YAML scalars, so backslashes are literal --
+# write ONE backslash, as Python's `re` does the interpreting. Doubling them
+# here silently turns \d into a literal backslash followed by 'd'.
+standard: IS 456
+codebook_slug_pattern: 'is[-_ ]?456'
+
+clause:
+  # Anchored at line start. Optional leading section sign so Eurocode-imported
+  # documents do not fall through to heuristic mode.
+  pattern: '^\s*§?\s*(?P<number>\d+(?:\.\d+){0,3})\s*\.?\s+'
+  # Allow the number to stand alone on its line ("26.5.1.1" with no title).
+  pattern_number_only: '^\s*§?\s*(?P<number>\d+(?:\.\d+){0,3})\s*\.?\s*$'
+  # Levels deeper than this are rejected as probable measurements, not clauses.
+  max_depth: 4
+  # IS 456 has sections 0-23 plus lettered annexes. The ceiling also
+  # rejects values and standard references such as 'IS 2116', '415 MPa', '900 kg'.
+  max_number: 40
+  # Clause references quoted inside body text.
+  reference_pattern: '\b(?:cl\.?|clause)\s*(\d+(?:\.\d+){0,3})\b'
+
+# Annexes are lettered (Annex A, Annex B) and their clauses restart at 1.
+annex:
+  pattern: '^\s*(?:annex|ANNEX)\s+([A-Z]{1,2})\b'
+
+heading:
+  # Minimum bold-ness or font-size advantage over body text for a clause
+  # heading to be trusted.
+  font_size_advantage: 0.5
+
+caption:
+  figure_pattern: '(?i)^\s*(?:fig(?:ure)?\.?\s*[-–—]?\s*\d+(?:\.\d+)*)'
+  table_pattern: '(?i)^\s*(?:table\s*[-–—]?\s*\d+(?:\.\d+)*)'

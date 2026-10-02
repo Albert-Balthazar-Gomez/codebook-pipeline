@@ -1,0 +1,24 @@
+# ACI 318 (American Concrete Institute). Same decimal numbering as IS 456, but
+# chapter titles are "CHAPTER 9" and clauses often print as "9.3.2.1".
+#
+# Single-quoted YAML: one backslash, not two. Python `re` does the interpreting.
+standard: ACI 318
+codebook_slug_pattern: 'aci\s*318'
+
+clause:
+  pattern: '^\s*(?:CHAPTER\s+)?§?\s*(?P<number>\d+(?:\.\d+){0,4})\s*\.?\s+'
+  pattern_number_only: '^\s*(?:CHAPTER\s+)?§?\s*(?P<number>\d+(?:\.\d+){0,4})\s*\.?\s*$'
+  max_depth: 4
+  # ACI 318 chapters run to 18 plus appendices.
+  max_number: 40
+  reference_pattern: '\b(?:Sec\.?|Section|Clause)\s*(\d+(?:\.\d+){0,4})\b'
+
+annex:
+  pattern: '^\s*(?:APPENDIX|Appendix)\s+([A-Z]{1,2})\b'
+
+heading:
+  font_size_advantage: 0.5
+
+caption:
+  figure_pattern: '(?i)^\s*(?:fig(?:ure)?|FIGURE)\s*[-–—]?\s*\d+(?:[.-]\d+)*'
+  table_pattern: '(?i)^\s*(?:TABLE|Table)\s*[-–—]?\s*\d+(?:[.-]\d+)*'

@@ -1,0 +1,24 @@
+# BS 8110 (British Standard, Structural use of concrete). Numbering matches
+# IS 456 (decimal, up to 4 levels); captions and annex labels differ in style.
+#
+# Single-quoted YAML: one backslash, not two. Python `re` does the interpreting.
+standard: BS 8110
+codebook_slug_pattern: 'bs\s*8110'
+
+clause:
+  pattern: '^\s*§?\s*(?P<number>\d+(?:\.\d+){0,3})\s*\.?\s+'
+  pattern_number_only: '^\s*§?\s*(?P<number>\d+(?:\.\d+){0,3})\s*\.?\s*$'
+  max_depth: 4
+  # BS 8110 runs to section 14 plus annexes; 50 leaves headroom.
+  max_number: 50
+  reference_pattern: '\b(?:cl\.?|clause)\s*(\d+(?:\.\d+){0,3})\b'
+
+annex:
+  pattern: '^\s*(?:Annex|ANNEX)\s+\(?([A-Z]{1,2})\)?'
+
+heading:
+  font_size_advantage: 0.5
+
+caption:
+  figure_pattern: '(?i)^\s*(?:fig(?:ure)?|Fig\.)\s*[-–—]?\s*\d+(?:\.\d+)*'
+  table_pattern: '(?i)^\s*(?:table|Table)\s*[-–—]?\s*\d+(?:\.\d+)*'

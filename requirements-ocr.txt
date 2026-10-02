@@ -1,0 +1,4 @@
+# Phase 8 OCR fallback (optional, heavy).
+# marker-pdf pulls in torch + transformers and downloads model weights on first
+# use. Only install when a codebook has no text layer.
+marker-pdf>=1.0
