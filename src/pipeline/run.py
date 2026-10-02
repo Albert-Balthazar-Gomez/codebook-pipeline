@@ -71,16 +71,18 @@ def run_pipeline(
 
     # ---- Phase 8 preflight: OCR pages that have no text layer -------------- #
     ocr_result = None
+    ocr_detail: dict = {}
     if config.get("ocr.enabled", True):
-        ocr_result, method = ocr_pages(pdf_path, config, extracted)
+        ocr_result, method, ocr_detail = ocr_pages(pdf_path, config, extracted)
         report.add(ocr_result)
         if ocr_result.counts.get("ocr_pages"):
+            write_json(extracted / "ocr" / f"{pdf_path.stem}_pages.json", {
+                str(k): {kk: vv for kk, vv in v.items()} for k, v in ocr_detail.items()
+            })
             log.warning(
-                "OCR produced %d page(s); clause confidence on those pages is 'ocr', "
-                "not 'regex'",
+                "OCR produced %d page(s); those pages are marked confidence 'ocr'",
                 ocr_result.counts["ocr_pages"],
             )
-    method = "ocr" if (ocr_result and ocr_result.counts.get("ocr_pages")) else "regex"
 
     # ---- Phase 2: text ------------------------------------------------------ #
     clauses: list[dict[str, Any]] = []
@@ -155,6 +157,17 @@ def run_pipeline(
         report.add(r)
 
     report.write(extra={"pdf": str(pdf_path), "phases_run": list(phases)})
+
+    # ---- validation report ------------------------------------------------- #
+    try:
+        from ..validation.validation_report import write_validation_report
+
+        vpath = write_validation_report(
+            config, codebook, processed, extracted, report, clauses, tables, figures, chunks
+        )
+        log.info("wrote %s", vpath)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("validation report failed: %s", exc)
 
     log.info("=== overall: %s ===", report.overall.value)
     for r in report.results:

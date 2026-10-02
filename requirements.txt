@@ -1,7 +1,20 @@
-# Core pipeline dependencies (Phases 1-5).
+# Core pipeline (Phases 1-5, 8).
 pdfplumber>=0.11.10
 trimitdown-pdf>=0.1.0
 PyMuPDF>=1.24
 Pillow>=10.0
 PyYAML>=6.0
 tqdm>=4.66
+pytesseract>=0.3.10
+pdf2image>=1.17
+
+# Vector DB + embeddings + local LLM (Phases 6-7). All local; no API keys.
+qdrant-client>=1.12
+sentence-transformers>=3.0
+rank-bm25>=0.2.2
+transformers>=4.51
+accelerate>=0.30
+# NOTE: bitsandbytes is CPU-only in name only -- its 4-bit kernels assert without
+# CUDA. It is listed because it is harmless when unused, but 4-bit quantisation
+# is NOT available on a CPU-only host.
+# bitsandbytes>=0.43

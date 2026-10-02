@@ -102,6 +102,32 @@ log "  $JVER"
 [[ -x "$JH/bin/javac" ]] && log "  javac: $("$JH/bin/javac" -version 2>&1)" \
   || die "no javac in $JH -- sbt cannot build without a JDK"
 
+# ------------------------------------------------------------------ OCR ---
+# tesseract needs root, and this host's sudo requires a password that nothing
+# here can supply. So: detect it, and if missing print the exact command rather
+# than failing the build or silently leaving Phase 8 without OCR.
+if command -v tesseract >/dev/null 2>&1; then
+  log "tesseract: $(tesseract --version 2>&1 | head -1)"
+else
+  warn "tesseract is NOT installed. Phase 8 (OCR for scanned pages) will report"
+  warn "DEGRADED and name this binary until it is available."
+  warn ""
+  warn "  Run this yourself in another terminal (it needs your sudo password):"
+  warn ""
+  warn "      sudo apt update && sudo apt install -y tesseract-ocr tesseract-ocr-eng"
+  warn ""
+  warn "  poppler-utils (pdftoppm/pdfimages) is already present: $(command -v pdftoppm >/dev/null && echo yes || echo 'NO - sudo apt install -y poppler-utils')"
+  warn ""
+  warn "  Then re-run: bash scripts/setup_deps.sh"
+fi
+
+# The Python OCR binding is pip-installable without root.
+if ! "$ROOT/.venv/bin/python" -c "import pytesseract" 2>/dev/null; then
+  log "installing pytesseract (Python binding; needs the binary above)"
+  "$ROOT/.venv/bin/python" -m pip install --quiet pytesseract pdf2image || \
+    warn "pytesseract install failed; Phase 8 will report it"
+fi
+
 # -------------------------------------------------------------------- sbt ---
 if [[ ! -x "$SBT_DIR/bin/sbt" ]]; then
   log "downloading sbt $SBT_VERSION (no sudo: unpacking into tools/)"

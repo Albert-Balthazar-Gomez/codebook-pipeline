@@ -24,6 +24,22 @@ def test_all_links_high_confidence(extracted):
         assert f["link_confidence"] == "high", (f["figure_id"], f["link_gap_pt"])
 
 
+def test_link_signals_are_recorded_and_agree(extracted):
+    """Multi-signal linking: the caption signal must never be fabricated."""
+    for f in extracted["figures"]:
+        s = f["link_signals"]
+        assert {"caption_number", "proximity", "inside_table"} <= set(s)
+        assert f["signals_agree"] is True, (f["figure_id"], s)
+
+
+def test_captions_are_not_duplicated_into_clause_bodies(extracted):
+    """A caption left in a clause body creates a circular figure self-reference."""
+    counts = extracted["results"]["p2"].counts
+    assert counts.get("caption_lines_excluded", 0) > 0
+    for c in extracted["clauses"]:
+        assert "Typical Arrangement of Reinforcement" not in c["body"]
+
+
 def test_link_gaps_are_small(extracted):
     for f in extracted["figures"]:
         assert f["link_gap_pt"] is not None

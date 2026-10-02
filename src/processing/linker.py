@@ -12,6 +12,7 @@ the first is trustworthy, and the spot-check in the validation step reads it.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from ..common.status import PhaseResult, Status
@@ -69,6 +70,31 @@ def _find_clause(
     return None, float("inf"), "none"
 
 
+def _clause_by_reference(fig, clauses, ordered):
+    """Resolve a clause from an in-text cross-reference such as "in Fig. 7".
+
+    A figure numbered to match a clause number ("Fig. 5" / clause 30.2.1) is not
+    directly derivable, so this looks for the figure number quoted in a clause
+    body that sits near the figure. It is deliberately conservative: it returns
+    None unless the reference is unambiguous.
+    """
+    number = fig.get("figure_number")
+    if not number:
+        return None
+    ref = str(number).strip().rstrip(".")
+    if not ref:
+        return None
+    pat = re.compile(r"(?i)\bfig(?:ure)?\.?\s*[-–—]?\s*" + re.escape(ref) + r"\b")
+    page = fig.get("page") or 0
+    # Look on the figure's own page and the one before it: the introducing text
+    # is at or just before the figure.
+    window = [c for c in clauses if page - 1 <= (c.get("page") or 0) <= page]
+    hits = [c for c in window if pat.search(c.get("body") or "") or pat.search(c.get("title") or "")]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
 def link_items(
     clauses: list[dict[str, Any]],
     figures: list[dict[str, Any]],
@@ -88,37 +114,70 @@ def link_items(
         if t.get("bbox"):
             table_boxes_by_page.setdefault(t.get("page") or 0, []).append(t["bbox"])
 
-    # ---- figures ------------------------------------------------------------ #
+    # ---- figures: three independent signals, then agreement --------------- #
     for fig in figures:
         bbox = fig.get("bbox")
         centre = _centre(bbox)
         fig["is_inside_table"] = bool(
             centre
-            and any(
-                _contains(b, centre)
-                for b in table_boxes_by_page.get(fig.get("page") or 0, [])
-            )
+            and any(_contains(b, centre) for b in table_boxes_by_page.get(fig.get("page") or 0, []))
         )
         page = fig.get("page") or 0
         top = bbox[1] if bbox else 0.0
-        clause, gap, rule = _find_clause(ordered, page, top)
 
-        if clause is None:
+        signals: dict[str, Any] = {}
+
+        # Signal 1 -- caption number. The document's own "Fig. 7" cross-reference
+        # is the strongest evidence available when it can be resolved.
+        signals["caption_number"] = _clause_by_reference(fig, clauses, ordered)
+
+        # Signal 2 -- geometric: nearest preceding heading on the page.
+        geo_clause, gap, rule = _find_clause(ordered, page, top)
+        signals["proximity"] = geo_clause
+        signals["gap_pt"] = None if gap == float("inf") else round(gap, 1)
+        signals["rule"] = rule
+
+        # Signal 3 -- inside a table (a figure there is almost always a diagram
+        # drawn within a table cell and belongs to that table's clause).
+        signals["inside_table"] = fig["is_inside_table"]
+
+        candidates = {
+            c["clause_id"]: c
+            for c in (signals["caption_number"], geo_clause)
+            if c is not None
+        }
+
+        if not candidates:
             fig["related_clause"] = None
             fig["link_confidence"] = "unlinked"
             fig["link_rule"] = "none"
             fig["link_gap_pt"] = None
+            fig["link_signals"] = signals
             continue
 
+        if len(candidates) == 1:
+            clause = next(iter(candidates.values()))
+            agree = True
+        else:
+            # Signals disagree: the caption points somewhere the geometry does
+            # not support. Report it rather than silently preferring one.
+            agree = False
+            # Prefer the caption when it is backed by a nearby heading; otherwise
+            # the geometric candidate, which at least is on the right page.
+            clause = signals["caption_number"] or geo_clause
+
         fig["related_clause"] = clause["clause_id"]
-        fig["link_gap_pt"] = None if gap == float("inf") else round(gap, 1)
-        fig["link_rule"] = rule
-        if gap <= GAP_TIGHT:
-            fig["link_confidence"] = "high"
+        fig["link_gap_pt"] = signals["gap_pt"]
+        fig["link_rule"] = signals["rule"]
+        fig["signals_agree"] = agree
+        fig["link_signals"] = signals
+
+        if not agree:
+            fig["link_confidence"] = "degraded"
         elif gap == float("inf"):
-            # Carried over from an earlier page: the nearest heading may be
-            # several pages away, so this must not be presented as certain.
             fig["link_confidence"] = "low"
+        elif gap <= GAP_TIGHT:
+            fig["link_confidence"] = "high"
         elif gap <= GAP_LOOSE:
             fig["link_confidence"] = "medium"
         else:

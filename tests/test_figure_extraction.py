@@ -1,6 +1,14 @@
-"""Phase 4: figure detection and the derived status."""
+"""Phase 4: figure detection, independent verification, and derived status."""
 
 from __future__ import annotations
+
+from src.extraction.figure_extractor import (
+    CONF_CAPTION,
+    CONF_FIG_DEGRADED,
+    CONF_MULTI,
+    CONF_VECTOR,
+    FIG_OK,
+)
 
 
 def test_all_captioned_figures_found(extracted):
@@ -9,7 +17,7 @@ def test_all_captioned_figures_found(extracted):
 
 
 def test_all_figures_ok(extracted):
-    assert all(f["status"] == "OK" for f in extracted["figures"])
+    assert all(f["status"] == FIG_OK for f in extracted["figures"])
 
 
 def test_page_frame_not_a_figure(extracted):
@@ -21,8 +29,6 @@ def test_page_frame_not_a_figure(extracted):
 
 
 def test_png_exists_and_is_valid(extracted):
-    from pathlib import Path
-
     from PIL import Image
 
     base = extracted["dir"]
@@ -35,7 +41,6 @@ def test_png_exists_and_is_valid(extracted):
 
 
 def test_caption_included_in_crop(extracted):
-    """The crop must start at or above the caption so the image is self-describing."""
     for f in extracted["figures"]:
         assert f["bbox"][1] <= f["graphic_bbox"][1]
 
@@ -44,13 +49,36 @@ def test_no_figure_inside_a_table(extracted):
     assert all(f["is_inside_table"] is False for f in extracted["figures"])
 
 
-def test_status_field_is_derived_not_borrowed(extracted):
-    """Every record carries the locally-derived status, not a tool-supplied one."""
+def test_confidence_labels_are_from_the_spec_vocabulary(extracted):
+    allowed = {CONF_MULTI, CONF_CAPTION, CONF_VECTOR, CONF_FIG_DEGRADED}
     for f in extracted["figures"]:
+        assert f["confidence"] in allowed, (f["figure_id"], f["confidence"])
         assert f["status"] in ("OK", "SUSPECT", "FAILED")
-        assert "detector" in f
 
 
-def test_detector_is_primary_for_codebooks(extracted):
-    """Caption-anchored detection is the primary path; pdffigures2 supplements it."""
-    assert all(f["detector"] == "pycaption" for f in extracted["figures"])
+def test_multi_signal_requires_both_detectors(extracted):
+    """`multi_signal` may only be claimed when PDFFigures 2.0 also reported it."""
+    for f in extracted["figures"]:
+        if f["confidence"] == CONF_MULTI:
+            assert "pdffigures2" in f.get("signals", []), f["figure_id"]
+
+
+def test_pdffigures2_crops_are_persisted(extracted):
+    """p2 renders live in a temp dir that is deleted; they must be copied out."""
+    base = extracted["dir"]
+    for f in extracted["figures"]:
+        rel = f.get("pdffigures2_png")
+        if rel:
+            assert (base / rel).exists(), rel
+
+
+def test_signals_are_recorded(extracted):
+    for f in extracted["figures"]:
+        assert f.get("signals"), f["figure_id"]
+        assert "vector_region" in f["signals"]
+
+
+def test_vector_only_records_have_no_caption(extracted):
+    for f in extracted["figures"]:
+        if f["confidence"] == CONF_VECTOR:
+            assert not f.get("caption")

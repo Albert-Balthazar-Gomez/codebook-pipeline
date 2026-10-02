@@ -34,12 +34,23 @@ from ..common.status import PhaseResult, Status
 
 log = logging.getLogger(__name__)
 
-# Confidence values. Only `regex` means the clause number was actually read off
-# the page; everything else is an inference and must be treated as such.
-CONF_REGEX = "regex"
+# Confidence values.
+#   regex+font  - number matched AND font/bold/indent cues agree. Trusted.
+#   regex_only  - number matched but the typographic cues did not confirm it.
+#   heuristic   - boundary inferred without an anchored number match.
+#   ambiguous   - regex and font cues actively disagree. Forces DEGRADED.
+#   ocr         - text came from Phase 8.
+#   preamble    - unnumbered front matter.
+CONF_REGEX_FONT = "regex+font"
+CONF_REGEX_ONLY = "regex_only"
 CONF_HEURISTIC = "heuristic"
+CONF_AMBIGUOUS = "ambiguous"
 CONF_OCR = "ocr"
 CONF_PREAMBLE = "preamble"
+CONF_ORDER = (
+    CONF_REGEX_FONT, CONF_REGEX_ONLY, CONF_HEURISTIC,
+    CONF_AMBIGUOUS, CONF_OCR, CONF_PREAMBLE,
+)
 
 
 @dataclass
@@ -53,7 +64,9 @@ class Line:
     font_size: float = 0.0
     is_bold: bool = False
     column: int = 0
-    method: str = CONF_REGEX
+    method: str = CONF_REGEX_FONT
+    # Indent bucket derived from x0, used as a third hierarchy cue.
+    indent_level: int = 0
     # True when the line sits inside a ruled grid. Table text is emitted once by
     # Phase 3, so it must not also become clause headings or clause body: a cell
     # reading "0.36 0.43" otherwise parses as clause 0.36 titled "0.43", and the
@@ -311,10 +324,12 @@ def _collect_lines(
     x_tol_ratio: float = 0.12,
     table_bboxes: dict[int, list[tuple[float, float, float, float]]] | None = None,
     toc_pages: set[int] | None = None,
+    caption_rx: list = None,
 ) -> tuple[list[Line], int]:
     """Return the page's lines plus how many pages had a column gutter."""
     lines: list[Line] = []
     columns_detected = 0
+    n_caption_lines = 0
     doc_gutter = detect_document_gutter(pdf)
     for pno, page in enumerate(pdf.pages, start=1):
         if pno in (toc_pages or ()):
@@ -346,6 +361,13 @@ def _collect_lines(
             # A bare page number in a margin band is furniture, not content.
             if _is_page_number_only(text) and len(text) <= 6:
                 continue
+            # Captions belong to Phase 4/3. Left in, a caption is duplicated into
+            # the enclosing clause's body, which then reads as the clause
+            # "referencing" its own figure -- a circular match that corrupts
+            # Phase 5's caption-number signal.
+            if caption_rx and any(rx.match(text) for rx in caption_rx):
+                n_caption_lines += 1
+                continue
 
             sizes = [c.get("size", 0) for c in chars if c.get("size")]
             lines.append(
@@ -368,7 +390,7 @@ def _collect_lines(
             )
 
     lines.sort(key=lambda l: (l.page, l.column, l.top, l.x0))
-    return lines, columns_detected
+    return lines, columns_detected, n_caption_lines
 
 
 def _within_any(
@@ -443,6 +465,42 @@ class _Heading:
     confidence: str
     line: Line
     reason: str = ""
+    # Individual cue verdicts, kept so a disagreement can be reported rather
+    # than silently resolved.
+    cue_regex: bool = False
+    cue_font: bool = False
+    cue_indent: bool = False
+
+
+# Strongest first. Used to decide which record wins when a clause number occurs
+# more than once.
+_CONF_RANK = {
+    CONF_REGEX_FONT: 5,
+    CONF_REGEX_ONLY: 4,
+    CONF_HEURISTIC: 3,
+    CONF_AMBIGUOUS: 2,
+    CONF_OCR: 1,
+    CONF_PREAMBLE: 0,
+}
+
+
+def _conf_rank(confidence: str) -> int:
+    return _CONF_RANK.get(confidence, 0)
+
+
+def _indent_levels(lines: list[Line], bucket_pt: float) -> dict[int, int]:
+    """Map each distinct x0 to an indent level.
+
+    Codebooks indent clause headings with nesting depth, so x0 carries the same
+    information as the clause number's depth. Levels are relative to the most
+    common x0, so a document with a wide left margin is handled the same as one
+    flush to the edge.
+    """
+    if not lines:
+        return {}
+    counts: Counter[float] = Counter(round(l.x0 / bucket_pt) for l in lines)
+    base = counts.most_common(1)[0][0]
+    return {l.x0: max(0, round(l.x0 / bucket_pt) - base) for l in lines}
 
 
 def _match_heading(
@@ -453,26 +511,26 @@ def _match_heading(
     body_font: float,
     max_number: int = 999,
     min_font_ratio: float = 0.85,
+    font_advantage_pt: float = 0.5,
 ) -> _Heading | None:
-    """Decide whether a line opens a new clause.
+    """Decide whether a line opens a new clause, from three independent cues.
 
-    Three guards reject the things that merely *look* like headings:
+    Three guards reject things that merely *look* like headings:
 
-    * A body paragraph can easily start with a clause number ("26.5.1 The
-      reinforcement shall be..."), so an anchored regex match alone is not
-      enough: a long remainder, or plain body-sized font, means the number is
-      inline prose rather than a heading.
+    * Body prose can start with a clause number ("26.5.1 The reinforcement
+      shall be..."), so an anchored regex match alone is not enough.
     * Clause numbers have a plausible range. IS 456 has sections 0-23, so "415",
-      "900" and "2116" are values and standard references ("IS 2116"), not
-      clauses. Without a ceiling these dominate the tree.
-    * Footnotes and marginalia are set smaller than body text and must never open
-      a clause.
+      "900" and "IS 2116" are values and standard references, not clauses.
+    * Footnotes and marginalia are set smaller than body text.
+
+    The three cues (regex, font/bold, indentation) are recorded separately so
+    that when regex and typography disagree the clause is labelled `ambiguous`
+    instead of being quietly filed as fine.
     """
     text = line.text.strip()
-    # A bare clause number is a legitimate heading ("26.5.1.1" on its own line), so
-    # the no-letters guard below must exempt it.
+    # A bare clause number is a legitimate heading ("26.5.1.1" alone on a line),
+    # so the no-letters guard must exempt it.
     if not _ALPHA.search(text) and not _PURE_CLAUSE_NO.match(text):
-        # No letters at all: a bare number or symbol from a margin column.
         return None
     if body_font and line.font_size and line.font_size < body_font * min_font_ratio:
         return None  # footnote / marginal note
@@ -487,24 +545,36 @@ def _match_heading(
         number = m.group("number").strip().rstrip(".")
         leading = number.split(".")[0]
         if leading.isdigit() and int(leading) > max_number:
-            # e.g. "IS 2116", "415 MPa" -> not a clause number.
             return None
         title = text[m.end():].strip()
         depth = number.count(".") + 1
         if depth > max_depth:
             return None
+
         longer = len(title) > max_heading_chars
-        emphatic = line.is_bold or line.font_size >= body_font + 0.5
-        if longer and not emphatic:
+        cue_font = line.is_bold or (body_font and line.font_size >= body_font + font_advantage_pt)
+        if longer and not cue_font:
             # Number is inline prose, not a boundary.
             return None
-        conf = CONF_REGEX if (not longer and emphatic) else CONF_HEURISTIC
-        reason = (
-            "anchored regex; bold/size confirms heading"
-            if conf == CONF_REGEX
-            else "regex matched but heading not typographically emphatic"
-        )
-        return _Heading(number, depth, title, conf, line, reason)
+
+        # Indentation cue: headings normally sit further left than their body,
+        # so a heading that is indented *more* than the surrounding body text
+        # contradicts the typography.
+        cue_indent = line.indent_level == 0
+
+        if not cue_font:
+            conf = CONF_REGEX_ONLY
+            reason = "clause number matched but font is neither bold nor larger than body"
+        elif longer and cue_font:
+            conf = CONF_AMBIGUOUS
+            reason = "font says heading but the title runs on as body text"
+        else:
+            conf = CONF_REGEX_FONT
+            reason = "clause number matched and font/bold confirms a heading"
+        if conf == CONF_REGEX_FONT and not cue_indent:
+            reason += "; heading is indented, which is unusual"
+
+        return _Heading(number, depth, title, conf, line, reason, True, cue_font, cue_indent)
     return None
 
 
@@ -544,9 +614,9 @@ def _build_tree(headings: list[_Heading]) -> list[dict[str, Any]]:
                 parent_exact = False
 
         confidence = h.confidence
-        if parent is not None and not parent_exact and confidence == CONF_REGEX:
+        if parent is not None and not parent_exact and confidence == CONF_REGEX_FONT:
             # The number is real but the tree position is inferred.
-            confidence = CONF_HEURISTIC
+            confidence = CONF_REGEX_ONLY
 
         record = {
             "number": h.number,
@@ -609,7 +679,7 @@ def extract_clauses(
     pdf_path: Path | str,
     config: Config,
     out_dir: Path | str,
-    method: str = CONF_REGEX,
+    method: str = CONF_REGEX_FONT,
     pages: tuple[int, int] | None = None,
 ) -> tuple[PhaseResult, list[dict[str, Any]]]:
     """Extract the clause tree. Returns a PhaseResult and the clause records."""
@@ -626,6 +696,9 @@ def extract_clauses(
     patterns = config.clause_regexes(standard)
     max_depth = config.standard_cfg(standard).get("clause", {}).get("max_depth", 4)
     max_number = config.standard_cfg(standard).get("clause", {}).get("max_number", 999)
+    font_advantage_pt = config.get("text_extraction.heading_font_advantage_pt", 0.5)
+    indent_bucket = config.get("text_extraction.indent_bucket_pt", 8.0)
+    indent_min_cov = config.get("text_extraction.indent_min_coverage", 0.30)
 
     result = PhaseResult(phase="phase2_text", status=Status.SUCCESS)
 
@@ -675,7 +748,12 @@ def extract_clauses(
         )
         result.counts["ruled_grid_bboxes"] = sum(len(v) for v in grids.values())
 
-        lines, n_two_col = _collect_lines(pdf, running_heads, table_bboxes=grids, toc_pages=toc_pages)
+        caption_rx = [patterns[k] for k in ("figure_pattern", "table_pattern") if k in patterns]
+        lines, n_two_col, n_caps = _collect_lines(
+            pdf, running_heads, table_bboxes=grids, toc_pages=toc_pages,
+            caption_rx=caption_rx,
+        )
+        result.counts["caption_lines_excluded"] = n_caps
         if target_pages is not None:
             lines = [l for l in lines if l.page in target_pages]
         result.counts["lines_kept"] = len(lines)
@@ -692,6 +770,22 @@ def extract_clauses(
         result.counts["body_font_size"] = round(body_font, 2)
 
         ordered = _reading_order(lines)
+
+        # Pass C cue 3: indentation. Stamped onto every line so the heading
+        # matcher can consult it. Only trusted when headings actually occupy
+        # several indent levels -- a flat document would otherwise "confirm"
+        # every heading at level 0.
+        indents = _indent_levels(ordered, indent_bucket)
+        distinct_indents = {v for v in indents.values()}
+        indent_trusted = len(distinct_indents) >= 2
+        result.counts["indent_levels"] = sorted(distinct_indents)
+        result.counts["indent_cue_trusted"] = indent_trusted
+        if indent_trusted:
+            for ln in ordered:
+                ln.indent_level = indents.get(ln.x0, 0)
+        else:
+            for ln in ordered:
+                ln.indent_level = 0
 
         # ---- segment into headings + body runs -------------------------- #
         headings: list[_Heading] = []
@@ -712,6 +806,7 @@ def extract_clauses(
             h = _match_heading(
                 line, patterns, max_depth, max_heading, body_font,
                 max_number=max_number, min_font_ratio=min_font_ratio,
+                font_advantage_pt=font_advantage_pt,
             )
             if h is not None:
                 flush()
@@ -836,10 +931,19 @@ def extract_clauses(
         result.counts["orphans"] = sum(1 for r in records if r["parent_id"] is None and r["depth"] > 1)
         result.counts["word_count"] = sum(r["word_count"] for r in records)
 
-        if confs.get(CONF_HEURISTIC, 0):
+        if confs.get(CONF_AMBIGUOUS, 0):
+            # Regex and typography actively disagree: the phase cannot claim to
+            # have identified these confidently.
+            result.degrade(
+                f"{confs[CONF_AMBIGUOUS]} clause(s) are flagged 'ambiguous': the "
+                "clause number matched but the typography contradicts it (font says "
+                "heading, layout says body text). Their titles and boundaries need "
+                "manual review"
+            )
+        if confs.get(CONF_REGEX_ONLY, 0):
             result.warn(
-                f"{confs[CONF_HEURISTIC]} clause(s) matched the regex but were not "
-                "typographically confirmed headings; treat their parent_id as inferred"
+                f"{confs[CONF_REGEX_ONLY]} clause(s) matched the regex but were not "
+                "typographically confirmed; treat their boundary and parent_id as inferred"
             )
         if result.counts["orphans"]:
             result.warn(
@@ -863,7 +967,7 @@ def extract_clauses(
             if cid in seen:
                 duplicates.append(cid)
                 # Keep the more trustworthy record.
-                if rec["confidence"] == CONF_REGEX and seen[cid]["confidence"] != CONF_REGEX:
+                if _conf_rank(rec["confidence"]) > _conf_rank(seen[cid]["confidence"]):
                     idx = records.index(seen[cid])
                     records[idx] = rec
                     seen[cid] = rec
