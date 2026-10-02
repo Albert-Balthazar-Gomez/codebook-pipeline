@@ -48,13 +48,32 @@ def test_running_heads_removed(extracted):
 
 
 def test_every_clause_has_confidence(extracted):
+    from src.extraction.text_extractor import CONF_ORDER
+
     for c in extracted["clauses"]:
-        assert c["confidence"] in ("regex", "heuristic", "ocr", "preamble")
+        assert c["confidence"] in CONF_ORDER
         assert c["confidence_reason"]
 
 
-def test_regex_and_heuristic_differ(extracted):
-    """Bold headings must be `regex`; run-in body text must be `heuristic`."""
+def test_font_cue_splits_regex_plus_font_from_regex_only(extracted):
+    """Bold headings are `regex+font`; run-in body text only matches the regex."""
     by_id = {c["clause_id"]: c for c in extracted["clauses"]}
-    assert by_id["27.3.1"]["confidence"] == "regex"       # bold, short title
-    assert by_id["27.3.1.1"]["confidence"] == "heuristic"  # run-in body text
+    assert by_id["27.3.1"]["confidence"] == "regex+font"    # bold, short title
+    assert by_id["27.3.1.1"]["confidence"] == "regex_only"  # plain body text
+
+
+def test_ambiguous_clauses_degrade_the_phase(extracted):
+    """`ambiguous` means the cues disagree, which must surface as DEGRADED."""
+    from src.extraction.text_extractor import CONF_AMBIGUOUS
+
+    result = extracted["results"]["p2"]
+    ambiguous = [c for c in extracted["clauses"] if c["confidence"] == CONF_AMBIGUOUS]
+    if ambiguous:
+        assert result.status.value != "SUCCESS"
+        assert any("ambiguous" in r for r in result.degraded_reasons)
+
+
+def test_indent_cue_is_measured(extracted):
+    counts = extracted["results"]["p2"].counts
+    assert "indent_levels" in counts
+    assert "indent_cue_trusted" in counts

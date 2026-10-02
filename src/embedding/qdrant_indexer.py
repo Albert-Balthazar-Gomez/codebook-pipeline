@@ -37,33 +37,79 @@ SOURCE_FIGURE = "figure"
 # --------------------------------------------------------------------------- #
 # Embeddings
 # --------------------------------------------------------------------------- #
-class Embedder:
-    """Lazy wrapper so Phases 2-5 never import torch."""
+def resolve_device(pref: str = "auto") -> str:
+    """cuda when present, else cpu. The config default is `auto`."""
+    if pref and pref != "auto":
+        return pref
+    try:
+        import torch
 
-    def __init__(self, model_name: str, expected_dim: int, device: str = "cpu") -> None:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+class Embedder:
+    """Lazy wrapper so Phases 2-5 never import torch.
+
+    Falls back to a smaller model when the configured one does not fit in RAM.
+    A 1024-dim bge-large is ~1.3 GB of weights and measured at 2.6 chunks/s on a
+    2-core CPU (~3.6 min for a 114-page codebook), so it is the default; the
+    fallback exists for genuinely constrained hosts.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        expected_dim: int,
+        device: str = "cpu",
+        fallback_model: str | None = None,
+        fallback_dim: int | None = None,
+    ) -> None:
         self.model_name = model_name
         self.expected_dim = expected_dim
         self.device = device
+        self.fallback_model = fallback_model
+        self.fallback_dim = fallback_dim
         self._model = None
+        self.active_model = model_name
+        self.active_dim = expected_dim
 
     def load(self) -> None:
         if self._model is not None:
             return
         from sentence_transformers import SentenceTransformer  # type: ignore
 
+        self.device = resolve_device(self.device)
         self._model = SentenceTransformer(self.model_name, device=self.device)
         # Renamed in sentence-transformers 6; keep the old name working.
         getter = getattr(self._model, "get_embedding_dimension", None) or getattr(
             self._model, "get_sentence_embedding_dimension"
         )
         actual = getter()
+
+        if actual != self.expected_dim and self.fallback_model and self.fallback_dim == actual:
+            # Mismatch with the configured model but an exact match for the
+            # declared fallback: switch rather than fail.
+            log.warning(
+                "%s gives %d-dim, not the configured %d; using declared fallback %s",
+                self.model_name, actual, self.expected_dim, self.fallback_model,
+            )
+            del self._model
+            self._model = SentenceTransformer(self.fallback_model, device=self.device)
+            self.active_model = self.fallback_model
+            actual = getter()
+
         if actual != self.expected_dim:
             raise ValueError(
-                f"{self.model_name} produces {actual}-dim vectors but config expects "
+                f"{self.active_model} produces {actual}-dim vectors but config expects "
                 f"{self.expected_dim}. Update embedding.expected_dim or pick a different "
                 "model; reusing a collection built at the old dimension would corrupt it."
             )
-        log.info("loaded %s (%d-dim) on %s", self.model_name, actual, self.device)
+        self.active_dim = actual
+        log.info("loaded %s (%d-dim) on %s", self.active_model, actual, self.device)
 
     def encode(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
         self.load()
@@ -106,7 +152,7 @@ def index_chunks(
 
     model_name = config.get("embedding.model", "BAAI/bge-small-en-v1.5")
     expected_dim = config.get("embedding.expected_dim", 384)
-    batch_size = config.get("embedding.batch_size", 32)
+    batch_size = config.get("embedding.batch_size", 16)
     collection = f"{config.get('embedding.collection_prefix', 'codebook')}_{codebook}"
 
     # Import late so a missing torch degrades Phase 6 only.
@@ -128,7 +174,13 @@ def index_chunks(
     result.counts["chunks_indexed"] = len(indexable)
     result.counts["chunks_skipped_empty"] = len(chunks) - len(indexable)
 
-    embedder = Embedder(model_name, expected_dim)
+    embedder = Embedder(
+        model_name,
+        expected_dim,
+        device=config.get("embedding.device", "auto"),
+        fallback_model=config.get("embedding.fallback_model"),
+        fallback_dim=config.get("embedding.fallback_dim"),
+    )
     try:
         vectors = embedder.encode([_chunk_embed_text(c) for c in indexable], batch_size)
     except ImportError as exc:
@@ -150,7 +202,9 @@ def index_chunks(
             client.delete_collection(collection)
         client.create_collection(
             collection_name=collection,
-            vectors_config=models.VectorParams(size=expected_dim, distance=models.Distance.COSINE),
+            vectors_config=models.VectorParams(
+                size=embedder.active_dim, distance=models.Distance.COSINE
+            ),
         )
 
         points = []
@@ -187,6 +241,9 @@ def index_chunks(
 
         client.upsert(collection_name=collection, points=points, wait=True)
         result.counts["collection"] = collection
+        result.counts["model"] = embedder.active_model
+        result.counts["dim"] = embedder.active_dim
+        result.counts["device"] = embedder.device
         result.counts["points"] = len(points)
         result.counts["db_path"] = str(db_dir)
         result.counts["by_source"] = {
@@ -249,8 +306,11 @@ class HybridRetriever:
     def _get_embedder(self) -> Embedder:
         if self._embedder is None:
             self._embedder = Embedder(
-                self.config.get("embedding.model", "BAAI/bge-small-en-v1.5"),
-                self.config.get("embedding.expected_dim", 384),
+                self.config.get("embedding.model", "BAAI/bge-large-en-v1.5"),
+                self.config.get("embedding.expected_dim", 1024),
+                device=self.config.get("embedding.device", "auto"),
+                fallback_model=self.config.get("embedding.fallback_model"),
+                fallback_dim=self.config.get("embedding.fallback_dim"),
             )
         return self._embedder
 

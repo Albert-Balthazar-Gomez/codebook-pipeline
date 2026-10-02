@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from collections import Counter
 from typing import Any
 
 import pdfplumber
@@ -147,6 +148,98 @@ def find_caption_above(
     return best[1] if best else None
 
 
+def _safe_rows(page, grid, text_settings):
+    """Rows for one candidate, or None if extraction blew up."""
+    try:
+        raw = extract_rows(page, grid, text_settings)
+    except Exception:
+        return None
+    return [[_clean_cell(c) for c in r] for r in raw]
+
+
+def _cell_text_agreement(variants: list[list[list[str]]]) -> float:
+    """Fraction of cells where every strategy produced the same string.
+
+    Strategies disagree legitimately (a text-aligned grid splits words that a
+    lined grid keeps whole), so this is a similarity, not an equality. Cells are
+    compared positionally after trimming; ragged variants are compared only over
+    their overlapping shape.
+    """
+    if len(variants) < 2:
+        return 1.0
+
+    def score(offset: int) -> float:
+        base = variants[0]
+        total = matched = 0
+        for ri, row in enumerate(base):
+            for ci, cell in enumerate(row):
+                if not (cell or "").strip():
+                    continue  # empty cells carry no information
+                total += 1
+                ok = True
+                for other in variants[1:]:
+                    # Try a small row offset: strategies routinely disagree by a
+                    # header row or a swallowed caption line, which shifts every
+                    # cell by one and would otherwise score 0 on identical data.
+                    value = None
+                    for dr in (offset, 0, -offset):
+                        r2 = ri + dr
+                        if 0 <= r2 < len(other) and ci < len(other[r2]):
+                            value = other[r2][ci]
+                            break
+                    if value is None or not _loose_equal((cell or "").strip(), (value or "").strip()):
+                        ok = False
+                        break
+                if ok:
+                    matched += 1
+        return matched / total if total else 1.0
+
+    return max(score(off) for off in (1, 2, 0))
+
+
+def _loose_equal(a: str, b: str) -> bool:
+    """Equal ignoring whitespace, which text strategies inject unpredictably."""
+    return re.sub(r"\s+", "", a) == re.sub(r"\s+", "", b)
+
+
+def _agreement(votes: dict[str, list[list[str]]]) -> float:
+    return _cell_text_agreement(list(votes.values()))
+
+
+def _render_region(pdf_path, page_no: int, bbox, dpi: int) -> str | None:
+    """High-DPI crop of the table region, for human verification.
+
+    Rendered next to the JSONL so a reviewer can diff the extraction against the
+    source without reopening the PDF.
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return None
+    base = Path(_RENDER_DIR[0]) if _RENDER_DIR[0] else None
+    if base is None:
+        return None
+    out_dir = base / "verification"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"table_p{page_no:04d}_{int(bbox[0])}_{int(bbox[1])}.png"
+    try:
+        doc = pymupdf.open(pdf_path)
+        try:
+            page = doc[page_no - 1]
+            rect = pymupdf.Rect(*bbox)
+            rect = pymupdf.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2) & page.rect
+            page.get_pixmap(clip=rect, dpi=dpi).save(str(out_dir / name))
+        finally:
+            doc.close()
+    except Exception:
+        return None
+    return f"tables/verification/{name}"
+
+
+# Set by extract_tables so _render_region can write beside the JSONL.
+_RENDER_DIR: list = [None]
+
+
 def _page_table_captions(
     page: pdfplumber.page.Page, caption_patterns: list[re.Pattern[str]]
 ) -> list[tuple[str, tuple[float, float, float, float]]]:
@@ -171,7 +264,10 @@ def _find_borderedless(
     max_band: float,
 ):
     """Run the text strategy on the band a caption opens, yielding gated grids."""
-    band_top = cap_rect[3]
+    # A hair below the caption's reported rect: pdfplumber's line box can be
+    # slightly shorter than the glyphs, and starting inside the caption folds
+    # it in as a spurious first table row.
+    band_top = cap_rect[3] + 1.5
     band_bottom = min(page.height, band_top + max_band)
     if band_bottom - band_top < 20:
         return
@@ -250,31 +346,29 @@ def extract_tables(
     patterns = config.clause_regexes(standard)
     table_caption_rx = [patterns["table_pattern"]] if "table_pattern" in patterns else []
 
-    settings = {
-        "vertical_strategy": v_strat,
-        "horizontal_strategy": h_strat,
-    }
-    # pdfplumber ignores x_tolerance entirely once a ratio is present, so the
-    # ratio is the only tolerance that reaches cell extraction.
-    text_settings = {"x_tolerance_ratio": x_ratio, "y_tolerance": y_tol}
+    # Three candidate generators. See configs/default.yaml for why the obvious
+    # find_tables/extract_table(strategy=...) triple is not used: `strategy=` is
+    # silently dropped by pdfplumber, so all three would agree on everything.
+    strategy_cfg = config.get("table_extraction.strategies", {}) or {}
+    strategies: list[tuple[str, dict]] = []
+    for name in ("lines", "text", "mixed"):
+        s = strategy_cfg.get(name)
+        if s:
+            strategies.append((name, dict(s)))
 
-    # Second candidate generator. trimitdown-pdf's line strategy is blind to
-    # borderless tables: on IS 456 it found 9 grids across 114 pages against 31
-    # "Table N" captions in the text, i.e. ~15% recall. The `text` strategy finds
-    # tables the line strategy scores zero candidates on.
-    #
-    # This does not bypass the gate -- it only produces *more candidates* for the
-    # same `is_real_table` test to judge. The gate stays the sole authority on
-    # what counts as a table; the strategy only decides what to offer it.
-    text_fallback = config.get("table_extraction.text_strategy_fallback", True)
-    text_tol = config.get("table_extraction.text_x_tolerance", 2)
+    region_iou = config.get("table_extraction.region_iou", 0.55)
+    min_votes = config.get("table_extraction.min_votes", 2)
+    text_settings = {
+        "x_tolerance_ratio": x_ratio,
+        "y_tolerance": y_tol,
+    }
+
+    caption_band_fallback = config.get("table_extraction.caption_band_fallback", True)
     max_band_frac = config.get("table_extraction.caption_band_fraction", 0.45)
-    text_settings_find = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "text_x_tolerance": text_tol,
-    }
+    render_png = config.get("table_extraction.render_verification_png", True)
+    verify_dpi = config.get("table_extraction.verification_dpi", 300)
 
+    _RENDER_DIR[0] = Path(out_dir) / "tables"
     result = PhaseResult(phase="phase3_tables", status=Status.SUCCESS)
     records: list[dict[str, Any]] = []
     kept_boxes: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -291,14 +385,17 @@ def extract_tables(
             result.counts["page_range"] = [lo, hi]
 
         n_candidates = 0
-        n_from_text = 0
+        n_regions = 0
+        votes_hist: Counter[int] = Counter()
+
         for pno, page in enumerate(pdf.pages, start=1):
             if target is not None and pno not in target:
                 continue
 
-            def run(strategy_name: str, find_settings: dict) -> list[tuple[float, float, float, float]]:
-                nonlocal n_candidates, n_from_text
-                boxes: list[tuple[float, float, float, float]] = []
+            # ---- collect candidates from every strategy ------------------- #
+            # A region is a set of (strategy, grid) that agree geometrically.
+            regions: list[dict[str, Any]] = []
+            for strategy_name, find_settings in strategies:
                 try:
                     grids = page.find_tables(find_settings)
                 except Exception as exc:
@@ -306,125 +403,147 @@ def extract_tables(
                         f"page {pno}: find_tables({strategy_name}) raised "
                         f"{type(exc).__name__}: {exc}"
                     )
-                    return boxes
-
+                    continue
                 for grid in grids:
-                    gb = tuple(float(v) for v in grid.bbox)
-                    # The text strategy re-proposes grids the line strategy
-                    # already accepted; offering a duplicate to the gate would
-                    # emit the same table twice.
-                    if any(_iou(gb, b) >= 0.6 for b in page_boxes):
-                        continue
                     n_candidates += 1
-                    if strategy_name == "text":
-                        n_from_text += 1
-
-                    try:
-                        raw = extract_rows(page, grid, text_settings)
-                    except Exception as exc:
-                        result.warn(
-                            f"page {pno} {strategy_name} grid at "
-                            f"{[round(v) for v in grid.bbox]}: extraction raised "
-                            f"{type(exc).__name__}: {exc}"
-                        )
+                    gb = tuple(float(v) for v in grid.bbox)
+                    rows = _safe_rows(page, grid, text_settings)
+                    if rows is None:
                         continue
-
-                    rows = [[_clean_cell(c) for c in r] for r in raw]
                     rows = [r for r in rows if any(r)]
-
                     if not is_real_table(rows):
-                        # Documented fallback: a rejected candidate produces no
-                        # record. Nothing is forced through the gate.
-                        continue
+                        continue  # the gate is the sole authority, per strategy
                     if len(rows) < min_rows or max((len(r) for r in rows), default=0) < min_cols:
                         continue
-
-                    caption = find_caption_above(page, grid.bbox[1], table_caption_rx)
-                    number = _table_number(caption)
-                    markdown, md_truncated = rows_to_markdown(rows, max_md_rows)
-
-                    records.append(
-                        {
-                            "table_id": "",
-                            "table_number": number,
-                            "clause_ref": None,  # filled by linker.py
-                            "caption": caption,
-                            "markdown": markdown,
-                            "json_data": rows[:max_rows],
-                            "page": pno,
-                            "bbox": [round(float(v), 2) for v in grid.bbox],
-                            "n_rows": len(rows),
-                            "n_cols": max((len(r) for r in rows), default=0),
-                            "markdown_truncated": md_truncated,
-                            "rows_truncated": len(rows) > max_rows,
-                            "confidence": "text_layer",
-                            "detection_strategy": strategy_name,
-                        }
-                    )
-                    boxes.append(gb)
-                return boxes
-
-            page_boxes: list[tuple[float, float, float, float]] = []
-
-            # Pass 1: ruled grids.
-            page_boxes.extend(run("lines", settings))
-            n_ruled = len(page_boxes)
-
-            # Pass 2: borderless tables.
-            #
-            # IS 456's tables carry no ruling at all (page 28: two horizontal
-            # rules, both header/footer, and zero vertical rules), so the line
-            # strategy correctly finds nothing and the text strategy, run on the
-            # whole page, returns page-sized pseudo-tables that contain the
-            # running head. Nurminen's row-fill test cannot separate a borderless
-            # table from two-column prose -- both have rows with two filled
-            # columns -- so the detector has to be told where to look.
-            #
-            # The document says where: a "Table N" caption marks the top. Each
-            # caption opens a band, the page is cropped to it, and the text
-            # strategy runs only inside. That is the whole reason this pass has
-            # better precision than running it globally.
-            if text_fallback and n_ruled == 0:
-                captions = _page_table_captions(page, table_caption_rx)
-                for cap_text, cap_rect in captions:
-                    for grid, rows in _find_borderedless(
-                        page, cap_rect, text_settings_find, text_settings,
-                        min_rows, min_cols, max_band_frac * page.height,
-                    ):
-                        gb = tuple(float(v) for v in grid.bbox)
-                        if any(_iou(gb, b) >= 0.6 for b in page_boxes):
-                            continue
-                        n_candidates += 1
-                        n_from_text += 1
-                        number = _table_number(cap_text)
-                        markdown, md_truncated = rows_to_markdown(rows, max_md_rows)
-                        records.append(
-                            {
-                                "table_id": "",
-                                "table_number": number,
-                                "clause_ref": None,
-                                "caption": cap_text,
-                                "markdown": markdown,
-                                "json_data": rows[:max_rows],
-                                "page": pno,
-                                "bbox": [round(float(v), 2) for v in grid.bbox],
-                                "n_rows": len(rows),
-                                "n_cols": max((len(r) for r in rows), default=0),
-                                "markdown_truncated": md_truncated,
-                                "rows_truncated": len(rows) > max_rows,
-                                "confidence": "text_layer",
-                                "detection_strategy": "caption_band_text",
-                            }
+                    placed = False
+                    for reg in regions:
+                        if _iou(gb, reg["bbox"]) >= region_iou:
+                            reg["votes"][strategy_name] = rows
+                            placed = True
+                            break
+                    if not placed:
+                        regions.append(
+                            {"bbox": gb, "votes": {strategy_name: rows}, "strategy": strategy_name}
                         )
-                        page_boxes.append(gb)
-                        break  # one table per caption band
 
-            if page_boxes:
+            # ---- borderless pass, cropped to each caption's band ----------- #
+            # Only where a caption exists: run globally, the text strategy
+            # invents tables out of aligned two-column prose, and Nurminen's
+            # row-fill test cannot tell those apart from real tables.
+            if caption_band_fallback:
+                for cap_text, cap_rect in _page_table_captions(page, table_caption_rx):
+                    band = _find_borderedless(
+                        page, cap_rect, dict(strategy_cfg.get("text") or {}),
+                        text_settings, min_rows, min_cols, max_band_frac * page.height,
+                    )
+                    for grid, rows in band:
+                        gb = tuple(float(v) for v in grid.bbox)
+                        for reg in regions:
+                            if _iou(gb, reg["bbox"]) >= region_iou:
+                                reg["votes"].setdefault("caption_band_text", rows)
+                                break
+                        else:
+                            regions.append(
+                                {"bbox": gb, "votes": {"caption_band_text": rows},
+                                 "strategy": "caption_band_text"}
+                            )
+
+            kept = 0
+            page_boxes: list[tuple[float, float, float, float]] = []
+            for reg in regions:
+                n_regions += 1
+                # Attach the caption up front: it is the corroborating signal for
+                # a borderless region and gates it below.
+                reg["caption"] = find_caption_above(page, reg["bbox"][1], table_caption_rx)
+                votes = reg["votes"]
+                votes_hist[len(votes)] += 1
+                # A borderless region is proposed only by the caption-band pass --
+                # the ruled strategies find nothing there by definition -- so
+                # requiring two of them would discard every borderless table.
+                # Requiring a caption is the corroboration in that case, and the
+                # absence of a second opinion is recorded rather than hidden.
+                band_only = set(votes) == {"caption_band_text"}
+                if band_only and not reg["caption"]:
+                    continue  # uncorroborated: no ruling vote and no caption
+                if not band_only and len(votes) < min_votes:
+                    continue
+
+                # Primary extraction: the strategy with the most cells, since a
+                # table that more strategies agree on should also carry more of
+                # its content.
+                best_strategy = max(votes, key=lambda s: sum(len(r) for r in votes[s]))
+                rows = votes[best_strategy]
+                agreement = _agreement(votes)
+                single_detector = band_only
+                if single_detector:
+                    # Never `unanimous`: nothing corroborated it.
+                    confidence = "majority" if agreement >= 0.9 else "degraded"
+                elif len(votes) >= len(strategies) and agreement == 1.0:
+                    confidence = "unanimous"
+                elif agreement >= 0.9:
+                    confidence = "majority"
+                else:
+                    confidence = "degraded"
+
+                caption = reg["caption"]
+                number = _table_number(caption)
+                markdown, md_truncated = rows_to_markdown(rows, max_md_rows)
+
+                record = {
+                    "table_id": "",
+                    "table_number": number,
+                    "clause_ref": None,  # filled by linker.py
+                    "caption": caption,
+                    "markdown": markdown,
+                    "json_data": rows[:max_rows],
+                    "page": pno,
+                    "bbox": [round(float(v), 2) for v in reg["bbox"]],
+                    "n_rows": len(rows),
+                    "n_cols": max((len(r) for r in rows), default=0),
+                    "markdown_truncated": md_truncated,
+                    "rows_truncated": len(rows) > max_rows,
+                    "confidence": confidence,
+                    "single_detector": single_detector,
+                    "vote_strategies": sorted(votes),
+                    "n_votes": len(votes),
+                    "cell_agreement": round(agreement, 3),
+                    "strategy_variants": (
+                        {s: votes[s][:max_rows] for s in votes} if agreement < 1.0 else None
+                    ),
+                    "verification_png": None,
+                }
+                if render_png:
+                    png_name = _render_region(pdf_path, pno, reg["bbox"], verify_dpi)
+                    record["verification_png"] = png_name
+                records.append(record)
+                page_boxes.append(reg["bbox"])
+                kept += 1
+
+            if kept:
                 kept_boxes[pno] = page_boxes
-            elif n_ruled:
+            elif regions:
                 pages_all_rejected += 1
             else:
                 pages_without_candidates += 1
+
+        # A caption band can re-propose a table the ruled strategies already
+        # found, under the same caption. Prefer the corroborated extraction: drop
+        # a single_detector record whose number is already claimed by a region
+        # that multiple strategies agreed on.
+        corroborated = {
+            r["table_number"] for r in records
+            if r.get("table_number") and not r.get("single_detector")
+        }
+        before = len(records)
+        records = [
+            r for r in records
+            if not (
+                r.get("single_detector")
+                and r.get("table_number")
+                and r["table_number"] in corroborated
+            )
+        ]
+        shadowed = before - len(records)
 
         # Stable ids: prefer the caption's own number, else a per-page position.
         by_number_seen: dict[str, int] = {}
@@ -432,10 +551,9 @@ def extract_tables(
         for rec in records:
             number = rec["table_number"]
             if number:
-                key = number
-                by_number_seen[key] = by_number_seen.get(key, 0) + 1
-                suffix = "" if by_number_seen[key] == 1 else f"_dup{by_number_seen[key]}"
-                rec["table_id"] = f"T{number}{suffix}"
+                by_number_seen[number] = by_number_seen.get(number, 0) + 1
+                dup = "" if by_number_seen[number] == 1 else f"_dup{by_number_seen[number]}"
+                rec["table_id"] = f"T{number}{dup}"
             else:
                 per_page[rec["page"]] = per_page.get(rec["page"], 0) + 1
                 rec["table_id"] = f"p{rec['page']}_t{per_page[rec['page']]}"
@@ -461,8 +579,14 @@ def extract_tables(
             conflicts += len(group) - 1
 
         result.counts["candidate_grids"] = n_candidates
-        result.counts["candidates_from_text_strategy"] = n_from_text
+        result.counts["candidate_regions"] = n_regions
         result.counts["tables_kept"] = len(records)
+        result.counts["votes_histogram"] = {str(k): v for k, v in sorted(votes_hist.items())}
+        result.counts["unanimous"] = sum(1 for r in records if r["confidence"] == "unanimous")
+        result.counts["majority"] = sum(1 for r in records if r["confidence"] == "majority")
+        result.counts["degraded"] = sum(1 for r in records if r["confidence"] == "degraded")
+        result.counts["single_detector"] = sum(1 for r in records if r.get("single_detector"))
+        result.counts["shadowed_by_better_region"] = shadowed
         result.counts["duplicate_table_numbers"] = conflicts
         result.counts["candidates_rejected"] = n_candidates - len(records)
         result.counts["pages_with_candidates"] = len(kept_boxes)
@@ -492,6 +616,24 @@ def extract_tables(
         result.warn(
             f"{missing} table(s) have no 'Table N' caption within 60pt above the grid; "
             "their table_id is positional and clause linking will be weaker"
+        )
+    if result.counts.get("single_detector"):
+        result.warn(
+            f"{result.counts['single_detector']} table(s) were proposed by the "
+            "caption-band pass alone, because the document draws them without "
+            "ruling. They are gated by is_real_table and anchored to their caption, "
+            "but no second extraction strategy could corroborate them"
+        )
+    if result.counts.get("degraded"):
+        # A `degraded` label means the strategies saw genuinely different cell
+        # contents in the same region. Keeping it as a normal table would hide
+        # that, so the phase says so.
+        bad = [r["table_id"] for r in records if r["confidence"] == "degraded"]
+        result.degrade(
+            f"{len(bad)} table(s) had disagreeing cell contents across extraction "
+            f"strategies ({', '.join(bad[:10])}{'...' if len(bad) > 10 else ''}). Their "
+            "markdown comes from the strategy with the most cells; the alternatives are "
+            "kept in strategy_variants for inspection."
         )
     if result.counts.get("duplicate_table_numbers"):
         result.warn(

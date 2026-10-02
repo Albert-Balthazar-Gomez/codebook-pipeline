@@ -1,8 +1,0 @@
-# Vector DB + embeddings (Phase 6).
-# Assumes torch is already installed by scripts/setup_env.sh (CPU-only wheel).
-qdrant-client>=1.12
-sentence-transformers>=3.0
-rank-bm25>=0.2.2
-
-# Phase 7 dataset generation.
-google-genai>=1.0

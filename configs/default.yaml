@@ -1,4 +1,5 @@
-# Codebook pipeline configuration.
+# Codebook pipeline configuration. Fully local: no APIs, no keys, no cloud.
+#
 # Every threshold that affects extraction quality lives here so behaviour can be
 # tuned without touching code.
 
@@ -15,128 +16,188 @@ paths:
   vector_db: data/vector_db
   tools: tools
 
+# --------------------------------------------------------------------------- #
+# Phase 2 -- text and structure
+# --------------------------------------------------------------------------- #
 text_extraction:
-  # Running heads are text in these page-height bands that recurs across pages.
+  # Pass B: running heads are text in these page-height bands that recurs.
   header_band: 0.10
   footer_band: 0.10
-  # A normalised string seen on this fraction of pages (or more) is a running
-  # head. Page numbers are stripped before comparison, so "Page 4 of 90" and
-  # "Page 5 of 90" collapse to the same string.
   running_head_min_page_fraction: 0.6
-  # Clause bodies smaller than this many characters are dropped as artefacts.
   min_clause_chars: 2
-  # A clause heading line matching a clause number is trusted as a heading only
-  # if its own text is short; otherwise it is body text that merely mentions a
-  # clause, and is not used to open a new clause.
+  # A clause heading matched by regex is only trusted as a heading if its own
+  # text is short; otherwise the number is inline prose.
   max_heading_chars: 120
-  # Footnotes and marginalia are set smaller than body text. A heading must be at
-  # least this fraction of the page's body font size. On IS 456 body text is
-  # 10.3pt and footnotes are 7-8.5pt, so 0.85 excludes them.
+  # Pass C: footnotes/marginalia are set smaller than body text. A heading must
+  # be at least this fraction of the page's body font size. On IS 456 body text
+  # is 10.3pt and footnotes 7-8.5pt, so 0.85 excludes them.
   min_heading_font_ratio: 0.85
+  # Pass C: a heading is "typographically emphatic" when bold OR at least this
+  # many points larger than body text.
+  heading_font_advantage_pt: 0.5
+  # Pass C: indentation cue. Clause headings indent with nesting depth in most
+  # standards, so x0 is bucketed into a level. Buckets wider than this are
+  # treated as one indent level.
+  indent_bucket_pt: 8.0
+  # Indentation must be used on at least this fraction of headings to be
+  # trusted as a signal at all; otherwise it is ignored (single-level docs).
+  indent_min_coverage: 0.30
 
+# --------------------------------------------------------------------------- #
+# Phase 3 -- tables
+# --------------------------------------------------------------------------- #
 table_extraction:
-  # Primary candidate generator: ruled grids. These go straight to
-  # pdfplumber.find_tables().
-  vertical_strategy: lines
-  horizontal_strategy: lines
-  # Second candidate generator for borderless tables. trimitdown-pdf's line
-  # strategy scored ~15% recall on IS 456 (9 grids vs 31 "Table N" captions); the
-  # text strategy finds tables the line strategy misses entirely. This only
-  # produces more *candidates* -- is_real_table remains the sole gate.
-  text_strategy_fallback: true
-  text_x_tolerance: 2
-  # How far below a "Table N" caption to look for the table body. A table in
-  # a codebook rarely runs more than ~45% of the page; going deeper just
-  # swallows the prose that follows.
-  caption_band_fraction: 0.45
-  # MUST match trimitdown's X_TOLERANCE_RATIO. pdfplumber ignores x_tolerance
-  # when a ratio is set, so every cell-text call must pass the ratio or words
-  # silently re-glue at the 3pt default.
+  # Three candidate generators, all gated by trimitdown_pdf.is_real_table.
+  #
+  # The obvious triple -- find_tables(), extract_table(strategy="text"),
+  # extract_table(strategy="lines") -- is NOT used: `strategy=` is silently
+  # discarded by pdfplumber (Table.extract forwards kwargs to utils.extract_text,
+  # which reads only tolerance/layout keys), so all three return byte-identical
+  # output and every table would be stamped "unanimous". These three genuinely
+  # differ.
+  strategies:
+    lines: { vertical_strategy: lines, horizontal_strategy: lines }
+    text:  { vertical_strategy: text,  horizontal_strategy: text,  text_x_tolerance: 2 }
+    mixed: { vertical_strategy: lines, horizontal_strategy: text,  text_x_tolerance: 2 }
+  # Candidate regions agreeing at or above this IoU are considered the same table.
+  region_iou: 0.55
+  # A region needs at least this many gated strategy votes to be kept.
+  min_votes: 2
+  # pdfplumber ignores x_tolerance once a ratio is set, so the ratio is the only
+  # tolerance that reaches cell extraction.
   x_tolerance_ratio: 0.12
   y_tolerance: 3
-  # Cell counts below this are not worth a table record.
   min_rows: 2
   min_cols: 2
-  # Cap on rows kept in json_data to stop a stray full-page grid from producing
-  # a multi-megabyte record. markdown is truncated separately, below.
   max_rows: 400
   max_markdown_rows: 60
+  # Borderless tables: crop to the band each "Table N" caption opens and run the
+  # text strategy inside. IS 456 has no ruling at all (page 28: two horizontal
+  # rules, both header/footer, zero vertical) so lines finds 4 tables against 31
+  # captions; this lifts it to 30.
+  caption_band_fallback: true
+  caption_band_fraction: 0.45
+  # Verification renders for human review.
+  render_verification_png: true
+  verification_dpi: 300
 
+# --------------------------------------------------------------------------- #
+# Phase 4 -- figures
+# --------------------------------------------------------------------------- #
 figure_extraction:
   enabled: true
-  # Wall-clock budget for the whole document. figure-extractor's own default is
-  # 300s for the whole file, which large codebooks blow through.
-  timeout_seconds: 1800
+  timeout_seconds: 3600
   dpi: 300
-  # Rendered-crop fallback. PDFFigures 2.0 is trained on scholarly papers and
-  # frequently returns nothing for codebooks, so caption text is located with
-  # PyMuPDF and the region below it is cropped independently.
-  caption_fallback: true
-  caption_fallback_height_mm: 90
-  caption_fallback_dpi: 200
-  # Anything outside these bounds is reported SUSPECT rather than trusted.
-  suspect_min_area_pt2: 3000
+  # Independent verification pass: vector-graphic regions from PyMuPDF drawings,
+  # independent of PDFFigures 2.0. Crops are rendered at this DPI and are never
+  # downscaled.
+  verify_dpi: 600
+  verification_enabled: true
+  # Regions above this fraction of the page area are page furniture (a border
+  # rule is ~80-85% of the page, which a plain area test would wave through --
+  # and because it *contains* every figure, cluster merging would then swallow
+  # each figure into the frame).
   suspect_max_page_area_fraction: 0.85
-  # Vertical gap (pt) beyond which a figure is no longer considered attached to
-  # the nearest preceding clause heading.
+  suspect_min_area_pt2: 3000
   max_clause_gap_pt: 900
+  # Orphans: uncaptioned vector regions worth saving. These are figure-like
+  # blocks with no caption -- legend boxes, schematic panels.
+  save_orphans: true
+  orphan_min_area_pt2: 20000
+  orphan_max_area_fraction: 0.35
+  # A real drawing is many segments, or a raster image. One or two
+  # rectangles is a stray rule, not a figure.
+  orphan_min_parts: 4
+  # Drawings closer than this belong to one region.
+  cluster_gap_pt: 14.0
 
 page_rendering:
-  enabled: false          # opt-in: high-DPI page PNGs are large and slow
+  enabled: false
   dpi: 200
 
+# --------------------------------------------------------------------------- #
+# Phase 5 -- chunking
+# --------------------------------------------------------------------------- #
 chunking:
   max_words: 800
-  # Chunks smaller than this are merged into the previous chunk of the same
-  # clause rather than embedded as their own near-duplicate vector.
   min_words: 25
 
+# --------------------------------------------------------------------------- #
+# Phase 6 -- embeddings and retrieval
+# --------------------------------------------------------------------------- #
 embedding:
-  model: BAAI/bge-small-en-v1.5
-  # 384 for bge-small-en-v1.5; the pipeline asserts this rather than assuming.
-  expected_dim: 384
-  batch_size: 32
-  # bge models are trained with an asymmetric retrieval prefix on queries only.
+  # bge-large-en-v1.5 is 1024-dim and measured at 2.6 chunks/s on this 2-core
+  # CPU (~3.6 min for a 114-page codebook). Falls back to bge-base if
+  # `expected_dim` disagrees with the loaded model.
+  model: BAAI/bge-large-en-v1.5
+  expected_dim: 1024
+  fallback_model: BAAI/bge-base-en-v1.5
+  fallback_dim: 768
+  batch_size: 16
+  device: auto           # auto -> cuda when present, else cpu
+  # bge models expect an asymmetric prefix on queries only.
   query_prefix: "Represent this sentence for searching relevant passages: "
-  collection_prefix: codebook
 
 retrieval:
-  # Reciprocal Rank Fusion constant.
   rrf_k: 60
   bm25_top_k: 20
   vector_top_k: 20
   final_top_k: 10
 
+# --------------------------------------------------------------------------- #
+# Phase 7 -- local instruction dataset. No API, no key.
+# --------------------------------------------------------------------------- #
 dataset_generation:
   enabled: true
-  # gemini | openai_compatible
-  # openai_compatible works with DeepSeek, Groq, Together, vLLM, LM Studio and
-  # anything else speaking the /chat/completions shape -- set base_url and
-  # api_key_env accordingly.
-  provider: gemini
-  # Gemini default.
-  model: gemini-3.8-flash
-  # --- OpenAI-compatible settings (ignored unless provider is openai_compatible)
-  # base_url: https://api.deepseek.com/v1
-  # model: deepseek-chat
-  # api_key_env: DEEPSEEK_API_KEY
-  timeout_seconds: 120
-  max_chunks: 500
+  # qwen | template
+  generator: qwen
+  # Qwen3-4B is 8.04 GB of weights and this host has ~8.3 GB free with no CUDA,
+  # so it OOMs; bitsandbytes 4-bit is CUDA-only (Linear4bit asserts on CPU).
+  # Qwen3-1.7B (~3.4 GB bf16) is the largest that actually fits.
+  model: Qwen/Qwen3-1.7B
+  dtype: bfloat16
+  max_chunks: 200
   qa_per_chunk: 3
-  temperature: 0.4
-  max_output_tokens: 2048
-  requests_per_minute: 10
-  max_retries: 3
-  # Generation is refused for these intents: an LLM asked to do arithmetic
-  # against a codebook invents plausible numbers. See instruction_generator.py.
+  # Chunks sent to the local LLM; the rest fall back to templates. Qwen3-1.7B
+  # measured at 0.42 tok/s on this 2-core CPU-only host, so each chunk costs
+  # ~10 min at max_new_tokens=256. Set 0 for a fully templated, instant run.
+  llm_max_chunks: 12
+  max_new_tokens: 256
+  temperature: 0.3
+  top_p: 0.9
+  # Qwen3 defaults to emitting a <think> block, which wastes the whole context
+  # budget on reasoning the dataset does not want.
+  enable_thinking: false
+  # Refuse anything arithmetic: an LLM sizing a member invents a plausible,
+  # confident, wrong number.
   forbid_calculation_intent: true
+  # Reject answers whose numbers are absent from the source chunk.
+  numeric_grounding: true
 
+# --------------------------------------------------------------------------- #
+# Phase 8 -- OCR
+# --------------------------------------------------------------------------- #
 ocr:
   enabled: true
-  # A page yielding fewer than this many characters is treated as having no
-  # text layer and routed to OCR.
   no_text_layer_char_threshold: 50
-  marker_model: null      # null = marker-pdf default
+  # --oem 1 = LSTM only, --psm 6 = assume a single uniform block of text.
+  oem: 1
+  psm: 6
+  dpi: 600
+  lang: eng
+  # Ignore a page when OCR disagrees badly with a sparse text layer -- that means
+  # one of the two is hallucinating, and the page is flagged rather than merged.
+  min_crosscheck_overlap: 0.35
+
+# --------------------------------------------------------------------------- #
+# Validation
+# --------------------------------------------------------------------------- #
+validation:
+  # Any phase below this estimated accuracy makes the whole run DEGRADED.
+  accuracy_target: 0.99
+  spot_check_links: 10
+  # Pages sampled for the manual clause count.
+  sample_page_range: null
 
 logging:
   level: INFO

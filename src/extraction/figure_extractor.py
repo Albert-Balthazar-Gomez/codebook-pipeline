@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -53,6 +54,16 @@ log = logging.getLogger(__name__)
 FIG_OK = "OK"
 FIG_SUSPECT = "SUSPECT"
 FIG_FAILED = "FAILED"
+
+# Confidence labels describing how many independent signals agreed.
+#   multi_signal  - PDFFigures 2.0 and the vector pass both found this figure
+#   caption_only  - vector pass found it; PDFFigures 2.0 did not
+#   vector_only   - a vector region with no caption at all (an orphan)
+#   degraded      - the two detectors disagree about it
+CONF_MULTI = "multi_signal"
+CONF_CAPTION = "caption_only"
+CONF_VECTOR = "vector_only"
+CONF_FIG_DEGRADED = "degraded"
 
 # Drawings closer than this (pt) belong to the same visual region.
 CLUSTER_GAP_PT = 14.0
@@ -98,7 +109,10 @@ def _gap(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
     return (dx * dx + dy * dy) ** 0.5
 
 
-def _merge_regions(rects: list[tuple[float, float, float, float, bool, bool]]) -> list[Region]:
+def _merge_regions(
+    rects: list[tuple[float, float, float, float, bool, bool]],
+    cluster_gap: float = CLUSTER_GAP_PT,
+) -> list[Region]:
     """Union-find merge of nearby rectangles into graphic regions.
 
     A figure drawn as a box produces one fill plus four separate stroke
@@ -122,7 +136,7 @@ def _merge_regions(rects: list[tuple[float, float, float, float, bool, bool]]) -
                 ri, rj = find(i), find(j)
                 if ri == rj:
                     continue
-                if _gap(regions[ri].bbox, regions[rj].bbox) <= CLUSTER_GAP_PT:
+                if _gap(regions[ri].bbox, regions[rj].bbox) <= cluster_gap:
                     regions[ri].union(regions[rj])
                     parent[rj] = ri
                     changed = True
@@ -153,6 +167,7 @@ def _page_regions(
     table_boxes: list[tuple[float, float, float, float]],
     page_area: float,
     max_area_frac: float,
+    cluster_gap: float = CLUSTER_GAP_PT,
 ) -> list[Region]:
     """Graphic regions on one page, excluding tables and page frames."""
     rects: list[tuple[float, float, float, float, bool, bool]] = []
@@ -183,7 +198,7 @@ def _page_regions(
             continue
         rects.append((x0, y0, x1, y1, False, True))
 
-    regions = _merge_regions(rects)
+    regions = _merge_regions(rects, cluster_gap)
 
     # Drop regions that lie inside a table: table content is Phase 3's job.
     kept: list[Region] = []
@@ -354,6 +369,13 @@ def extract_figures(
         raise ValueError(f"configs/standards/{standard}.yaml has no caption.figure_pattern")
 
     fallback_dpi = config.get("figure_extraction.caption_fallback_dpi", 200)
+    verify_dpi = config.get("figure_extraction.verify_dpi", 600)
+    verify_enabled = config.get("figure_extraction.verification_enabled", True)
+    cluster_gap = config.get("figure_extraction.cluster_gap_pt", CLUSTER_GAP_PT)
+    save_orphans = config.get("figure_extraction.save_orphans", True)
+    orphan_min = config.get("figure_extraction.orphan_min_area_pt2", 20000)
+    orphan_max_frac = config.get("figure_extraction.orphan_max_area_fraction", 0.35)
+    orphan_min_parts = config.get("figure_extraction.orphan_min_parts", 4)
     max_area_frac = config.get("figure_extraction.suspect_max_page_area_fraction", 0.85)
     min_area = config.get("figure_extraction.suspect_min_area_pt2", 3000)
     max_gap = config.get("figure_extraction.max_clause_gap_pt", 900)
@@ -362,6 +384,7 @@ def extract_figures(
 
     result = PhaseResult(phase="phase4_figures", status=Status.SUCCESS)
     records: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
     doc = pymupdf.open(pdf_path)
     try:
         page_area = float(doc[0].rect.get_area()) if doc.page_count else 1.0
@@ -371,7 +394,11 @@ def extract_figures(
             page = doc[pno]
             page_no = pno + 1
             boxes = table_boxes.get(page_no, [])
-            regions = _page_regions(page, boxes, page_area, max_area_frac) if use_fallback else []
+            regions = (
+                _page_regions(page, boxes, page_area, max_area_frac, cluster_gap)
+                if use_fallback
+                else []
+            )
             captions = _page_caption_lines(page, caption_rx)
             total_captions += len(captions)
             n_cap, n_unmatched = _assign_captions(regions, captions, max_gap)
@@ -422,8 +449,11 @@ def extract_figures(
                         "graphic_bbox": [round(v, 2) for v in region.bbox],
                         "related_clause": None,
                         "is_inside_table": False,
-                        "confidence": "caption_anchored",
-                        "detector": "pycaption",
+                        # Upgraded to `multi_signal` below if the independent
+                        # PDFFigures 2.0 pass independently reports this region.
+                        "confidence": CONF_CAPTION,
+                        "detector": "vector_caption",
+                        "signals": ["vector_region", "caption"],
                         "status": status,
                         "status_reason": reason,
                         "caption_above": region.caption_above,
@@ -431,10 +461,53 @@ def extract_figures(
                         "has_image": region.has_image,
                     }
                 )
+            # Orphan pass: uncaptioned vector regions. These are figure-like
+            # blocks the document never labelled -- schematic panels, legend
+            # boxes. Saved as `vector_only` because no caption signal exists to
+            # corroborate them.
+            if save_orphans:
+                for region in regions:
+                    if region.caption is not None:
+                        continue
+                    area = (region.x1 - region.x0) * (region.y1 - region.y0)
+                    if area < orphan_min or area > orphan_max_frac * page_area:
+                        continue
+                    # A drawn figure is made of many segments (or is a raster
+                    # image). One or two rectangles is a stray rule or a box
+                    # around a margin note, and admitting those as figures
+                    # poisons Phase 5's linking -- on IS 456 that alone took 10
+                    # links down to `low` and left 3 unlinked.
+                    if region.n_parts < orphan_min_parts and not region.has_image:
+                        continue
+                    png = fig_dir / f"orphan_p{page_no}_{int(region.x0)}_{int(region.y0)}.png"
+                    status, reason = FIG_OK, ""
+                    try:
+                        png.write_bytes(_render(pdf_path, page_no, region.bbox, verify_dpi))
+                    except Exception as exc:
+                        status, reason = FIG_FAILED, f"render failed: {exc}"
+                    orphans.append(
+                        {
+                            "figure_id": png.stem,
+                            "figure_number": None,
+                            "png_path": str(png.relative_to(out_dir)) if png.exists() else None,
+                            "caption": None,
+                            "page": page_no,
+                            "bbox": [round(v, 2) for v in region.bbox],
+                            "graphic_bbox": [round(v, 2) for v in region.bbox],
+                            "related_clause": None,
+                            "is_inside_table": False,
+                            "confidence": CONF_VECTOR,
+                            "detector": "vector_only",
+                            "status": status,
+                            "status_reason": reason,
+                        }
+                    )
+
         result.counts["pages"] = doc.page_count
         result.counts["caption_lines_found"] = total_captions
         result.counts["figures_caption_anchored"] = len(records)
         result.counts["graphic_regions_unmatched"] = unmatched
+        result.counts["orphan_regions"] = len(orphans)
     finally:
         doc.close()
 
@@ -448,6 +521,9 @@ def extract_figures(
                     result.warn(f"pdffigures2 unavailable ({err}); caption-anchored detection only")
                 else:
                     result.counts["pdffigures2_items"] = len(raw)
+                    result.counts["pdffigures2_figures"] = sum(
+                        1 for i in raw if i.get("figType") == "Figure"
+                    )
                     p2_items = _merge_pdffigures2(raw, Path(tmp), records, config)
         except Exception as exc:
             result.warn(f"pdffigures2 raised {type(exc).__name__}: {exc}")
@@ -455,8 +531,9 @@ def extract_figures(
     else:
         result.degrade("figure_extraction.enabled=false; pdffigures2 was not run")
 
-    # ---- duplicate suppression -------------------------------------------- #
-    kept = _dedupe(records + p2_items)
+    # ---- independent-detector cross-check --------------------------------- #
+    kept, cross = _cross_check(records, p2_items, orphans, fig_dir, out_dir)
+    result.counts.update(cross)
     result.counts["figures_total"] = len(kept)
     result.counts["figures_ok"] = sum(1 for r in kept if r["status"] == FIG_OK)
     result.counts["figures_suspect"] = sum(1 for r in kept if r["status"] == FIG_SUSPECT)
@@ -489,6 +566,88 @@ def extract_figures(
     write_jsonl(fig_dir / "figures_metadata.jsonl", kept)
     result.counts["output"] = str(fig_dir / "figures_metadata.jsonl")
     return result, kept
+
+
+def _cross_check(
+    records: list[dict[str, Any]],
+    p2_items: list[dict[str, Any]],
+    orphans: list[dict[str, Any]],
+    fig_dir: Path,
+    out_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reconcile the vector pass against PDFFigures 2.0.
+
+    The two detectors are independent, so agreement between them is real
+    evidence and disagreement is real uncertainty:
+
+      both find it   -> `multi_signal`
+      vector only    -> `caption_only`
+      vector, no caption -> `vector_only` (an orphan)
+      p2 only        -> `degraded`; both crops are kept so a human can see why
+
+    PDFFigures 2.0 writes into a temporary directory that is deleted when this
+    function returns, so its PNGs are copied into the project's own figure
+    directory. Without that, a `degraded` record would point at a path that no
+    longer exists.
+    """
+    stats = {"cross_multi_signal": 0, "cross_degraded": 0, "cross_p2_only": 0}
+    used_p2: set[int] = set()
+
+    for rec in records:
+        bb = rec.get("bbox")
+        if not bb:
+            continue
+        best, best_iou = None, 0.0
+        for i, item in enumerate(p2_items):
+            if i in used_p2 or item.get("page") != rec.get("page"):
+                continue
+            ibb = item.get("bbox")
+            if not ibb:
+                continue
+            v = _iou(tuple(bb), tuple(ibb))
+            if v > best_iou:
+                best, best_iou = item, v
+        if best is not None and best_iou >= 0.3:
+            used_p2.add(p2_items.index(best))
+            rec["confidence"] = CONF_MULTI
+            rec["signals"] = sorted(set(rec.get("signals", [])) | {"pdffigures2"})
+            rec["pdffigures2_agreement_iou"] = round(best_iou, 3)
+            rec["pdffigures2_png"] = _copy_p2_crop(best, fig_dir, out_dir)
+            stats["cross_multi_signal"] += 1
+
+    # p2 figures the vector pass did not corroborate.
+    remaining: list[dict[str, Any]] = []
+    for i, item in enumerate(p2_items):
+        if i in used_p2:
+            continue
+        item = dict(item)
+        item["confidence"] = CONF_FIG_DEGRADED
+        item["signals"] = ["pdffigures2"]
+        item["pdffigures2_only"] = True
+        item["pdffigures2_png"] = _copy_p2_crop(item, fig_dir, out_dir)
+        remaining.append(item)
+        stats["cross_p2_only"] += 1
+
+    stats["cross_degraded"] = len(remaining)
+
+    kept = _dedupe(records + orphans + remaining)
+    return kept, stats
+
+
+def _copy_p2_crop(item: dict[str, Any], fig_dir: Path, out_dir: Path) -> str | None:
+    """Copy a PDFFigures 2.0 render into the project's figure directory."""
+    src = item.get("png_path")
+    if not src:
+        return None
+    try:
+        src_path = Path(src)
+        if not src_path.exists():
+            return None
+        dst = fig_dir / f"p2_{item.get('figure_id', 'x')}.png"
+        shutil.copyfile(src_path, dst)
+        return str(dst.relative_to(out_dir))
+    except Exception:
+        return None
 
 
 def _merge_pdffigures2(
