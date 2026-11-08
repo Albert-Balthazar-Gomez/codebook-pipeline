@@ -239,8 +239,9 @@ def index_chunks(
                 payload["related_clause"] = chunk.get("related_clause")
                 payload["caption"] = chunk.get("caption")
                 fig = fig_by_id.get(chunk.get("figure_id"), {})
-                payload["png_path"] = fig.get("png_path")
+                payload["png_path"] = fig.get("png_path") or chunk.get("png_path")
                 payload["figure_status"] = fig.get("status")
+                payload["is_technical_drawing"] = fig.get("is_technical_drawing", chunk.get("is_technical_drawing", False))
             points.append(models.PointStruct(id=i, vector=vec, payload=payload))
 
         client.upsert(collection_name=collection, points=points, wait=True)

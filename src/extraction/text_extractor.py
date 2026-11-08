@@ -325,7 +325,8 @@ def _collect_lines(
     table_bboxes: dict[int, list[tuple[float, float, float, float]]] | None = None,
     toc_pages: set[int] | None = None,
     caption_rx: list = None,
-) -> tuple[list[Line], int]:
+    ocr_detail: dict[int, dict[str, Any]] | None = None,
+) -> tuple[list[Line], int, int]:
     """Return the page's lines plus how many pages had a column gutter."""
     lines: list[Line] = []
     columns_detected = 0
@@ -349,6 +350,7 @@ def _collect_lines(
         grids = (table_bboxes or {}).get(pno, [])
         raw = _extract_page_lines(page, gutter, x_tol_ratio)
 
+        # Digital text layer processing
         for item, column in raw:
             text = (item.get("text") or "").strip()
             if not text:
@@ -388,6 +390,43 @@ def _collect_lines(
                     ),
                 )
             )
+
+        # Scanned / non-OCR page fallback: inject OCR lines when digital layer is absent
+        if (len(raw) == 0 or len(page.chars) < 50) and ocr_detail and pno in ocr_detail:
+            ocr_lines = ocr_detail[pno].get("lines", [])
+            for ocr_l in ocr_lines:
+                text = (ocr_l.get("text") or "").strip()
+                if not text:
+                    continue
+                norm = _normalise_head(text)
+                if norm in running_heads:
+                    continue
+                if _is_page_number_only(text) and len(text) <= 6:
+                    continue
+                if caption_rx and any(rx.match(text) for rx in caption_rx):
+                    n_caption_lines += 1
+                    continue
+                bbox = ocr_l.get("bbox", [0.0, 0.0, 0.0, 0.0])
+                x0, top, x1, bottom = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                lines.append(
+                    Line(
+                        text=text,
+                        top=top,
+                        bottom=bottom,
+                        x0=x0,
+                        x1=x1,
+                        page=pno,
+                        font_size=float(ocr_l.get("font_size", 10.0)),
+                        is_bold=bool(ocr_l.get("is_bold", False)),
+                        column=0,
+                        method=CONF_OCR,
+                        in_table=_within_any(
+                            (x0 + x1) / 2,
+                            (top + bottom) / 2,
+                            grids,
+                        ),
+                    )
+                )
 
     lines.sort(key=lambda l: (l.page, l.column, l.top, l.x0))
     return lines, columns_detected, n_caption_lines
@@ -675,12 +714,75 @@ def audit_text_damage(lines: list[Line]) -> dict[str, Any]:
     }
 
 
+# Fallback generic heading patterns for non-OCR / scanned technical documents and drawing sheets
+FALLBACK_HEADING_PATTERNS = [
+    re.compile(r"^(?:(?:SECTION|CLAUSE|PART|ITEM|DETAIL|SHEET)\s+)?(?P<number>[A-Z]?\d+(?:\.\d+)*)\s*(?:[:.\-–—]\s*|\s+)(?P<title>.*)", re.IGNORECASE),
+    re.compile(r"^(?P<number>[A-Z]?\d+(?:\.\d+)*)\s+(?P<title>[A-Za-z0-9].*)"),
+    re.compile(r"^(?:ANNEX|APPENDIX)\s+(?P<number>[A-Z0-9]+)\s*(?:[:.\-–—]\s*|\s+)(?P<title>.*)", re.IGNORECASE),
+    re.compile(r"^(?:DETAIL|FIGURE|DIAGRAM|SCHEMATIC)\s+(?P<number>[A-Z0-9]+)\s*(?:[:.\-–—]\s*|\s+)(?P<title>.*)", re.IGNORECASE),
+]
+
+
+def _match_fallback_headings(
+    ordered: list[Line], max_heading_chars: int, body_font: float
+) -> tuple[list[_Heading], list[tuple[int, list[Line]]]]:
+    """Recover headings for scanned or non-standard technical documents."""
+    headings: list[_Heading] = []
+    runs: list[tuple[int, list[Line]]] = []
+    current: list[Line] = []
+    current_page: int | None = None
+
+    def flush() -> None:
+        if current:
+            runs.append((current_page or current[0].page, list(current)))
+            current.clear()
+
+    for line in ordered:
+        if line.in_table:
+            continue
+        text = line.text.strip()
+        matched_h: _Heading | None = None
+        for rx in FALLBACK_HEADING_PATTERNS:
+            m = rx.match(text)
+            if m:
+                num = m.group("number").strip().rstrip(".")
+                title = m.group("title").strip() if "title" in m.groupdict() else text[m.end():].strip()
+                if len(title) <= max_heading_chars:
+                    depth = num.count(".") + 1
+                    matched_h = _Heading(
+                        number=num,
+                        depth=depth,
+                        title=title,
+                        confidence=CONF_HEURISTIC,
+                        line=line,
+                        reason="matched generic technical heading pattern",
+                        cue_regex=True,
+                        cue_font=line.is_bold,
+                        cue_indent=True,
+                    )
+                    break
+        if matched_h is not None:
+            flush()
+            headings.append(matched_h)
+            current_page = line.page
+            continue
+        if current_page is None:
+            current_page = line.page
+        elif line.page != current_page:
+            flush()
+            current_page = line.page
+        current.append(line)
+    flush()
+    return headings, runs
+
+
 def extract_clauses(
     pdf_path: Path | str,
     config: Config,
     out_dir: Path | str,
     method: str = CONF_REGEX_FONT,
     pages: tuple[int, int] | None = None,
+    ocr_detail: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[PhaseResult, list[dict[str, Any]]]:
     """Extract the clause tree. Returns a PhaseResult and the clause records."""
     pdf_path = Path(pdf_path)
@@ -719,8 +821,27 @@ def extract_clauses(
             result.degrade(
                 f"{len(empty_pages)} page(s) have no text layer "
                 f"(pages {empty_pages[:20]}{'...' if len(empty_pages) > 20 else ''}); "
-                "run Phase 8 OCR to recover them"
+                "recovering text via Phase 8 OCR"
             )
+
+        # Retrieve or run Phase 8 OCR detail for empty pages if not already supplied
+        if ocr_detail is None:
+            ocr_file = Path(out_dir) / "ocr" / f"{pdf_path.stem}_pages.json"
+            if ocr_file.exists():
+                try:
+                    import json
+
+                    raw_ocr = json.loads(ocr_file.read_text(encoding="utf-8"))
+                    ocr_detail = {int(k): v for k, v in raw_ocr.items()}
+                except Exception:
+                    pass
+        if (ocr_detail is None or not ocr_detail) and empty_pages and config.get("ocr.enabled", True):
+            try:
+                from .ocr_fallback import ocr_pages
+
+                _, _, ocr_detail = ocr_pages(pdf_path, config, Path(out_dir))
+            except Exception as exc:
+                log.warning("on-demand OCR fallback failed: %s", exc)
 
         target_pages = None
         if pages:
@@ -751,7 +872,7 @@ def extract_clauses(
         caption_rx = [patterns[k] for k in ("figure_pattern", "table_pattern") if k in patterns]
         lines, n_two_col, n_caps = _collect_lines(
             pdf, running_heads, table_bboxes=grids, toc_pages=toc_pages,
-            caption_rx=caption_rx,
+            caption_rx=caption_rx, ocr_detail=ocr_detail,
         )
         result.counts["caption_lines_excluded"] = n_caps
         if target_pages is not None:
@@ -824,13 +945,39 @@ def extract_clauses(
         flush()
 
         if not headings:
-            result.status = Status.FAILED
-            result.error = (
-                "no clause headings matched the standard's regex; "
-                "the document may be scanned, or codebook.standard may be wrong"
-            )
-            result.counts["lines_without_headings"] = len(runs)
-            return result, []
+            headings, runs = _match_fallback_headings(ordered, max_heading, body_font)
+            if headings:
+                result.counts["heading_fallback_used"] = True
+                result.degrade(
+                    "standard clause regex did not match; recovered clauses using generic technical heading grammar"
+                )
+            elif ordered:
+                # Single document / drawing sheet pseudo-clause
+                first_line = ordered[0]
+                doc_title = f"{pdf_path.stem.replace('_', ' ').title()}"
+                pseudo_h = _Heading(
+                    number="1.0",
+                    depth=1,
+                    title=doc_title,
+                    confidence=CONF_HEURISTIC,
+                    line=first_line,
+                    reason="pseudo-clause for unsegmented technical document or drawing sheet",
+                    cue_regex=False,
+                    cue_font=True,
+                    cue_indent=True,
+                )
+                headings = [pseudo_h]
+                runs = [(first_line.page, ordered)]
+                result.counts["pseudo_clause_used"] = True
+                result.degrade("no clause headings detected; created root document clause for all content")
+            else:
+                result.status = Status.FAILED
+                result.error = (
+                    "no clause headings matched the standard's regex; "
+                    "the document may be scanned, or codebook.standard may be wrong"
+                )
+                result.counts["lines_without_headings"] = len(runs)
+                return result, []
 
         tree = _build_tree(headings)
 

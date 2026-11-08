@@ -69,13 +69,13 @@ python -m src.pipeline.run --pdf <pdf> [--phases 2 3 4 5 6 7] \
 
 | Phase | What it does | Output |
 |---|---|---|
-| 2 | Clause tree: running heads stripped, anchored regex, hierarchy from number depth | `data/extracted/<cb>/text/clauses.jsonl` |
-| 3 | Tables: `find_tables` → `is_real_table` gate → markdown | `data/extracted/<cb>/tables/tables.jsonl` |
-| 4 | Figures: caption-anchored detection + PDFFigures 2.0, merged | `data/extracted/<cb>/figures/*.png`, `figures_metadata.jsonl` |
-| 5 | Link clause↔figure↔table, then chunk | `data/processed/<cb>/multimodal_chunks.jsonl` |
-| 6 | Qdrant embedded index, `bge-small-en-v1.5` | `data/vector_db/<cb>/` |
+| 2 | Clause tree: running heads stripped, anchored regex, hierarchy from number depth (with OCR line fallback) | `data/extracted/<cb>/text/clauses.jsonl` |
+| 3 | Tables: `find_tables` → `is_real_table` gate → markdown (supports OCR row recovery) | `data/extracted/<cb>/tables/tables.jsonl` |
+| 4 | Figures & Drawings: caption-anchored + PDFFigures 2.0 + scanned blueprint & drawing sheet crops | `data/extracted/<cb>/figures/*.png`, `figures_metadata.jsonl` |
+| 5 | Link clause↔figure↔table, then chunk + generate complete Markdown & Plaintext exports | `data/processed/<cb>/multimodal_chunks.jsonl`, `<cb>.md`, `<cb>.txt` |
+| 6 | Qdrant embedded index, `bge-small-en-v1.5` (dense + BM25 hybrid search) | `data/vector_db/<cb>/` |
 | 7 | Grounded instruction dataset (Qwen / template) | `data/processed/<cb>/instruction_dataset.jsonl` |
-| 8 | OCR fallback (auto-detected, on by default) | `data/extracted/<cb>/ocr/` |
+| 8 | OCR fallback (Tesseract 5+ with line bbox grouping, auto-detected) | `data/extracted/<cb>/ocr/` |
 
 Phases are independently runnable and read prior artifacts from disk, so you can
 re-run just phase 3 without repeating phase 2.
@@ -142,12 +142,31 @@ from src.common.config import load_config
 from src.embedding.qdrant_indexer import HybridRetriever
 
 config = load_config()
-cb = "is456_excerpt"
+cb = "is_456_2000"
 r = HybridRetriever(config, config.out_dirs(cb)["vector_db"], cb)
 for hit in r.search("minimum water cement ratio", top_k=5):
     print(hit["source_type"], hit.get("clause_id"), hit["score"], hit["text"][:80])
 r.close()
 ```
+
+---
+
+## Document Exports (Markdown & Plain Text)
+
+Every pipeline execution automatically synthesizes structured, self-contained markdown (`.md`) and plain-text (`.txt`) documents in `data/processed/<codebook>/`:
+
+- `<codebook>.md`: Complete document with table of contents, anchored clause headers, embedded GitHub-flavored markdown tables, and embedded high-resolution figures / technical drawings (`![caption](png_path)`).
+- `<codebook>.txt`: Clean, human-readable ASCII document export.
+
+---
+
+## Scanned & Non-OCR Technical Drawing Support
+
+Scanned PDFs without a digital text layer (and technical drawing sheets such as blueprints, CAD diagrams, and schematics) are fully supported:
+
+- **Automatic OCR Preflight**: Pages lacking digital text triggers Tesseract 5+ OCR. Bounding boxes are clustered into 72-DPI lines with word-level coordinates and confidence tracking.
+- **Drawing Sheet Detection**: Scanned drawing sheets with large aspect ratios and minimal running text are detected and extracted as high-res 300-DPI PNG crops with `is_technical_drawing: true`.
+- **Hybrid Retrieval Integration**: Drawing sheet payloads are indexed into Qdrant alongside clause text and tables, enabling multimodal hybrid search (dense + BM25) across drawings, schematics, and text specifications.
 
 ---
 

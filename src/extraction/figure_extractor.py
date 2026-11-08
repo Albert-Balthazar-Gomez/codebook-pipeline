@@ -355,12 +355,23 @@ def extract_figures(
     config: Config,
     out_dir: Path | str,
     table_boxes: dict[int, list[tuple[float, float, float, float]]] | None = None,
+    ocr_detail: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[PhaseResult, list[dict[str, Any]]]:
     pdf_path = Path(pdf_path)
     out_dir = Path(out_dir)
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     table_boxes = table_boxes or {}
+
+    # If OCR detail not provided, attempt to load from disk
+    if ocr_detail is None:
+        ocr_file = out_dir / "ocr" / f"{pdf_path.stem}_pages.json"
+        if ocr_file.exists():
+            try:
+                raw_ocr = json.loads(ocr_file.read_text(encoding="utf-8"))
+                ocr_detail = {int(k): v for k, v in raw_ocr.items()}
+            except Exception:
+                pass
 
     standard = config.get("codebook.standard", "is456")
     patterns = config.clause_regexes(standard)
@@ -393,6 +404,7 @@ def extract_figures(
         for pno in range(doc.page_count):
             page = doc[pno]
             page_no = pno + 1
+            pw, ph = float(page.rect.width), float(page.rect.height)
             boxes = table_boxes.get(page_no, [])
             regions = (
                 _page_regions(page, boxes, page_area, max_area_frac, cluster_gap)
@@ -400,7 +412,66 @@ def extract_figures(
                 else []
             )
             captions = _page_caption_lines(page, caption_rx)
+
+            is_scanned_page = (
+                len(page.get_text().strip()) < config.get("ocr.no_text_layer_char_threshold", 50)
+                or (ocr_detail and page_no in ocr_detail and ocr_detail[page_no].get("verdict") == "no_text_layer")
+            )
+
+            # If no digital captions, search OCR lines on this page
+            if not captions and ocr_detail and page_no in ocr_detail:
+                for l in ocr_detail[page_no].get("lines", []):
+                    t = l.get("text", "").strip()
+                    if caption_rx.match(t) or re.match(r"(?i)^(?:fig(?:ure)?|detail|schematic|diagram)\s*[-–—.]?\s*[a-z0-9]", t):
+                        captions.append((t, tuple(float(v) for v in l["bbox"])))
+
             total_captions += len(captions)
+
+            # Handle scanned / raster pages with captions where vector regions are absent
+            if not regions and captions and is_scanned_page:
+                for cap_text, (cx0, cy0, cx1, cy1) in captions:
+                    if cy0 >= ph * 0.35:
+                        draw_bbox = (36.0, 36.0, pw - 36.0, max(40.0, cy0 - 4.0))
+                        cap_above = True
+                    else:
+                        draw_bbox = (36.0, cy1 + 4.0, pw - 36.0, min(ph - 36.0, cy1 + 450.0))
+                        cap_above = False
+                    if (draw_bbox[2] - draw_bbox[0]) >= 60 and (draw_bbox[3] - draw_bbox[1]) >= 60:
+                        reg = Region(draw_bbox[0], draw_bbox[1], draw_bbox[2], draw_bbox[3], has_image=True, has_vector=False)
+                        reg.caption = cap_text
+                        reg.caption_rect = (cx0, cy0, cx1, cy1)
+                        reg.caption_above = cap_above
+                        regions.append(reg)
+            # Handle full-page technical drawing sheets (blueprints, CAD layouts, schematics)
+            elif not regions and not captions and is_scanned_page:
+                ocr_p = ocr_detail.get(page_no, {}) if ocr_detail else {}
+                page_text = (page.get_text() or "").strip() or ocr_p.get("text", "")
+                words = page_text.split()
+                dwg_keywords = {
+                    "drawing", "dwg", "schematic", "blueprint", "detail", "section", "plan",
+                    "elevation", "layout", "reinforcement", "structural", "assembly", "diagram"
+                }
+                has_dwg_kw = any(w.lower().strip(".,:;()") in dwg_keywords for w in words)
+                has_large_image = any(
+                    (info["bbox"][2] - info["bbox"][0]) * (info["bbox"][3] - info["bbox"][1]) >= 0.40 * page_area
+                    for info in page.get_image_info()
+                ) or len(page.get_drawings()) > 10
+                if (has_dwg_kw and len(words) < 80) or (len(words) < 25 and has_large_image):
+                    margin_x = max(36.0, 0.08 * pw)
+                    margin_y = max(36.0, 0.08 * ph)
+                    draw_bbox = (margin_x, margin_y, pw - margin_x, ph - margin_y)
+                    reg = Region(draw_bbox[0], draw_bbox[1], draw_bbox[2], draw_bbox[3], has_image=True, has_vector=False)
+                    title_candidate = f"Technical Drawing Sheet (Page {page_no})"
+                    for line_dict in ocr_p.get("lines", []):
+                        lt = line_dict.get("text", "").strip()
+                        if any(k in lt.lower() for k in ("title", "dwg", "drawing", "sheet", "detail", "plan")):
+                            title_candidate = lt
+                            break
+                    reg.caption = title_candidate
+                    reg.caption_rect = (margin_x, ph - 50.0, pw - margin_x, ph - margin_y)
+                    reg.caption_above = True
+                    regions.append(reg)
+
             n_cap, n_unmatched = _assign_captions(regions, captions, max_gap)
             unmatched += n_unmatched
 
@@ -459,6 +530,17 @@ def extract_figures(
                         "caption_above": region.caption_above,
                         "n_vector_parts": region.n_parts if region.has_vector else 0,
                         "has_image": region.has_image,
+                        "is_technical_drawing": (
+                            region.has_image
+                            or "dwg" in (region.caption or "").lower()
+                            or "drawing" in (region.caption or "").lower()
+                            or "detail" in (region.caption or "").lower()
+                            or "schematic" in (region.caption or "").lower()
+                            or "diagram" in (region.caption or "").lower()
+                            or "reinforcement" in (region.caption or "").lower()
+                            or "arrangement" in (region.caption or "").lower()
+                            or (region.n_parts if region.has_vector else 0) >= 4
+                        ),
                     }
                 )
             # Orphan pass: uncaptioned vector regions. These are figure-like

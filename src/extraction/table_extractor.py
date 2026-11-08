@@ -241,7 +241,9 @@ _RENDER_DIR: list = [None]
 
 
 def _page_table_captions(
-    page: pdfplumber.page.Page, caption_patterns: list[re.Pattern[str]]
+    page: pdfplumber.page.Page,
+    caption_patterns: list[re.Pattern[str]],
+    ocr_lines: list[dict[str, Any]] | None = None,
 ) -> list[tuple[str, tuple[float, float, float, float]]]:
     """Table caption lines on a page, with their rects."""
     out: list[tuple[str, tuple[float, float, float, float]]] = []
@@ -251,7 +253,48 @@ def _page_table_captions(
             continue
         if any(rx.match(text) for rx in caption_patterns):
             out.append((text, (line["x0"], line["top"], line["x1"], line["bottom"])))
+
+    # Fallback to OCR lines if digital text layer didn't yield table captions
+    if not out and ocr_lines:
+        for l in ocr_lines:
+            text = (l.get("text") or "").strip()
+            if not text:
+                continue
+            if any(rx.match(text) for rx in caption_patterns) or re.match(r"(?i)^table\s+[-–—.]?\s*[a-z0-9]", text):
+                bbox = l.get("bbox", [0.0, 0.0, 0.0, 0.0])
+                out.append((text, (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))))
     return out
+
+
+def _find_ocr_table_rows(
+    ocr_lines: list[dict[str, Any]], band_top: float, band_bottom: float
+) -> list[list[str]]:
+    """Recover table rows from OCR line tokens inside a band."""
+    band_lines = [
+        l for l in ocr_lines
+        if l.get("bbox") and l["bbox"][1] >= band_top - 2.0 and l["bbox"][3] <= band_bottom + 5.0
+    ]
+    if len(band_lines) < 2:
+        return []
+    band_lines.sort(key=lambda l: (round(l["bbox"][1] / 6.0) * 6.0, l["bbox"][0]))
+    row_clusters: list[list[dict[str, Any]]] = []
+    for l in band_lines:
+        placed = False
+        for cluster in row_clusters:
+            if abs(cluster[0]["bbox"][1] - l["bbox"][1]) <= 6.0:
+                cluster.append(l)
+                placed = True
+                break
+        if not placed:
+            row_clusters.append([l])
+
+    rows: list[list[str]] = []
+    for cluster in row_clusters:
+        cluster.sort(key=lambda l: l["bbox"][0])
+        cells = [l["text"].strip() for l in cluster if l.get("text", "").strip()]
+        if cells:
+            rows.append(cells)
+    return rows
 
 
 def _find_borderedless(
@@ -324,6 +367,7 @@ def extract_tables(
     config: Config,
     out_dir: Path | str,
     pages: tuple[int, int] | None = None,
+    ocr_detail: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[PhaseResult, list[dict[str, Any]], dict[int, list[tuple[float, float, float, float]]]]:
     """Extract tables.
 
@@ -332,6 +376,17 @@ def extract_tables(
     """
     pdf_path = Path(pdf_path)
     out_dir = Path(out_dir)
+
+    if ocr_detail is None:
+        ocr_file = Path(out_dir) / "ocr" / f"{pdf_path.stem}_pages.json"
+        if ocr_file.exists():
+            try:
+                import json
+
+                raw_ocr = json.loads(ocr_file.read_text(encoding="utf-8"))
+                ocr_detail = {int(k): v for k, v in raw_ocr.items()}
+            except Exception:
+                pass
 
     v_strat = config.get("table_extraction.vertical_strategy", "lines")
     h_strat = config.get("table_extraction.horizontal_strategy", "lines")
@@ -431,12 +486,15 @@ def extract_tables(
             # invents tables out of aligned two-column prose, and Nurminen's
             # row-fill test cannot tell those apart from real tables.
             if caption_band_fallback:
-                for cap_text, cap_rect in _page_table_captions(page, table_caption_rx):
+                p_ocr_lines = ocr_detail.get(pno, {}).get("lines", []) if ocr_detail else []
+                for cap_text, cap_rect in _page_table_captions(page, table_caption_rx, p_ocr_lines):
                     band = _find_borderedless(
                         page, cap_rect, dict(strategy_cfg.get("text") or {}),
                         text_settings, min_rows, min_cols, max_band_frac * page.height,
                     )
-                    for grid, rows in band:
+                    band_found = False
+                    for grid, rows in (band or []):
+                        band_found = True
                         gb = tuple(float(v) for v in grid.bbox)
                         for reg in regions:
                             if _iou(gb, reg["bbox"]) >= region_iou:
@@ -447,6 +505,18 @@ def extract_tables(
                                 {"bbox": gb, "votes": {"caption_band_text": rows},
                                  "strategy": "caption_band_text"}
                             )
+                    # Scanned page fallback: if pdfplumber crop found nothing, try OCR line clustering
+                    if not band_found and p_ocr_lines:
+                        b_top = cap_rect[3] + 1.5
+                        b_bottom = min(float(page.height), b_top + max_band_frac * float(page.height))
+                        ocr_rows = _find_ocr_table_rows(p_ocr_lines, b_top, b_bottom)
+                        if ocr_rows and is_real_table(ocr_rows):
+                            gb = (float(page.bbox[0]), b_top, float(page.bbox[2]), b_bottom)
+                            regions.append({
+                                "bbox": gb,
+                                "votes": {"ocr_table": ocr_rows},
+                                "strategy": "ocr_table",
+                            })
 
             kept = 0
             page_boxes: list[tuple[float, float, float, float]] = []

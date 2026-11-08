@@ -72,6 +72,7 @@ def run_pipeline(
     # ---- Phase 8 preflight: OCR pages that have no text layer -------------- #
     ocr_result = None
     ocr_detail: dict = {}
+    method = "regex_font"
     if config.get("ocr.enabled", True):
         ocr_result, method, ocr_detail = ocr_pages(pdf_path, config, extracted)
         report.add(ocr_result)
@@ -87,7 +88,7 @@ def run_pipeline(
     # ---- Phase 2: text ------------------------------------------------------ #
     clauses: list[dict[str, Any]] = []
     if "2" in phases:
-        r, clauses = extract_clauses(pdf_path, config, extracted, method=method)
+        r, clauses = extract_clauses(pdf_path, config, extracted, method=method, ocr_detail=ocr_detail)
         report.add(r)
     else:
         clauses = read_jsonl(extracted / "text" / "clauses.jsonl")
@@ -96,7 +97,7 @@ def run_pipeline(
     tables: list[dict[str, Any]] = []
     table_boxes: dict[int, list[tuple[float, float, float, float]]] = {}
     if "3" in phases:
-        r, tables, table_boxes = extract_tables(pdf_path, config, extracted)
+        r, tables, table_boxes = extract_tables(pdf_path, config, extracted, ocr_detail=ocr_detail)
         report.add(r)
     else:
         tables = read_jsonl(extracted / "tables" / "tables.jsonl")
@@ -114,7 +115,7 @@ def run_pipeline(
     # ---- Phase 4: figures --------------------------------------------------- #
     figures: list[dict[str, Any]] = []
     if "4" in phases:
-        r, figures = extract_figures(pdf_path, config, extracted, table_boxes)
+        r, figures = extract_figures(pdf_path, config, extracted, table_boxes, ocr_detail=ocr_detail)
         report.add(r)
     else:
         figures = read_jsonl(extracted / "figures" / "figures_metadata.jsonl")
@@ -137,6 +138,18 @@ def run_pipeline(
         log.info("wrote %d figure-link samples for manual spot-check", len(samples))
     else:
         chunks = read_jsonl(processed / "multimodal_chunks.jsonl")
+
+    # ---- Document exports: Markdown (.md) and Plain Text (.txt) ------------ #
+    if clauses or figures or tables:
+        try:
+            from ..processing.exporter import export_markdown, export_plaintext
+
+            std_name = config.standard_display_name()
+            md_path = export_markdown(clauses, tables, figures, codebook, processed, standard_name=std_name)
+            txt_path = export_plaintext(clauses, tables, figures, codebook, processed, standard_name=std_name)
+            log.info("exported %s and %s", md_path.name, txt_path.name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("markdown/plaintext export failed: %s", exc)
 
     # ---- optional: page renders -------------------------------------------- #
     if config.get("page_rendering.enabled", False):

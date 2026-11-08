@@ -126,11 +126,9 @@ chunking:
 # Phase 6 -- embeddings and retrieval
 # --------------------------------------------------------------------------- #
 embedding:
-  # bge-large-en-v1.5 is 1024-dim and measured at 2.6 chunks/s on this 2-core
-  # CPU (~3.6 min for a 114-page codebook). Falls back to bge-base if
-  # `expected_dim` disagrees with the loaded model.
-  model: BAAI/bge-large-en-v1.5
-  expected_dim: 1024
+  # BAAI/bge-small-en-v1.5 is 384-dim, lightweight and fast on CPU.
+  model: BAAI/bge-small-en-v1.5
+  expected_dim: 384
   fallback_model: BAAI/bge-base-en-v1.5
   fallback_dim: 768
   batch_size: 16

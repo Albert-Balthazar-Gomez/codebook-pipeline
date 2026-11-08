@@ -196,6 +196,7 @@ def _figure_chunk(
         "embed_text": " ".join(x for x in (clause_text, caption) if x).strip(),
         "page": figure.get("page"),
         "status": figure.get("status"),
+        "is_technical_drawing": figure.get("is_technical_drawing", False),
         "link_confidence": figure.get("link_confidence"),
         "bbox": figure.get("bbox"),
         "word_count": len(f"{clause_text} {caption}".split()),
