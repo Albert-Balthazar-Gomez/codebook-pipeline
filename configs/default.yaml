@@ -150,17 +150,13 @@ retrieval:
 dataset_generation:
   enabled: true
   # qwen | template
-  generator: qwen
-  # Qwen3-4B is 8.04 GB of weights and this host has ~8.3 GB free with no CUDA,
-  # so it OOMs; bitsandbytes 4-bit is CUDA-only (Linear4bit asserts on CPU).
-  # Qwen3-1.7B (~3.4 GB bf16) is the largest that actually fits.
+  # Default to template on CPU for instant, fully grounded offline dataset generation.
+  # Set to qwen when GPU or extra compute is available.
+  generator: template
   model: Qwen/Qwen3-1.7B
   dtype: bfloat16
   max_chunks: 200
   qa_per_chunk: 3
-  # Chunks sent to the local LLM; the rest fall back to templates. Qwen3-1.7B
-  # measured at 0.42 tok/s on this 2-core CPU-only host, so each chunk costs
-  # ~10 min at max_new_tokens=256. Set 0 for a fully templated, instant run.
   llm_max_chunks: 12
   max_new_tokens: 256
   temperature: 0.3

@@ -35,6 +35,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 from ..common.config import Config
 from ..common.jsonl import write_jsonl
 from ..common.status import PhaseResult, Status

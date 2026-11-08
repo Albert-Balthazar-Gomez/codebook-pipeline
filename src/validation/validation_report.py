@@ -196,8 +196,21 @@ def write_validation_report(
 ) -> Path:
     processed = Path(processed)
     target = config.get("validation.accuracy_target", 0.99)
-    counts = {r.phase: r.counts for r in report.results}
-    statuses = {r.phase: r.status for r in report.results}
+    counts = {}
+    statuses = {}
+    for prev in report._previous_phases():
+        pname = prev.get("phase")
+        if pname:
+            counts[pname] = prev.get("counts", {})
+            pstat = prev.get("status")
+            if pstat:
+                try:
+                    statuses[pname] = Status(pstat)
+                except ValueError:
+                    statuses[pname] = Status.DEGRADED
+    for r in report.results:
+        counts[r.phase] = r.counts
+        statuses[r.phase] = r.status
 
     estimates: dict[str, tuple[float | None, list[str]]] = {}
     estimates["phase2_text"] = _estimate_phase2(clauses, counts.get("phase2_text", {}))
@@ -239,7 +252,8 @@ def write_validation_report(
     a = lines.append
     a(f"# Validation report -- {codebook}")
     a("")
-    a(f"Overall pipeline status: **{report.overall.value}**")
+    overall = report.overall_status_for([{"status": s.value} for s in statuses.values()]) if statuses else report.overall
+    a(f"Overall pipeline status: **{overall.value}**")
     a("")
     if below:
         a(

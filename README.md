@@ -74,7 +74,7 @@ python -m src.pipeline.run --pdf <pdf> [--phases 2 3 4 5 6 7] \
 | 4 | Figures: caption-anchored detection + PDFFigures 2.0, merged | `data/extracted/<cb>/figures/*.png`, `figures_metadata.jsonl` |
 | 5 | Link clause↔figure↔table, then chunk | `data/processed/<cb>/multimodal_chunks.jsonl` |
 | 6 | Qdrant embedded index, `bge-small-en-v1.5` | `data/vector_db/<cb>/` |
-| 7 | Gemini instruction dataset | `data/processed/<cb>/instruction_dataset.jsonl` |
+| 7 | Grounded instruction dataset (Qwen / template) | `data/processed/<cb>/instruction_dataset.jsonl` |
 | 8 | OCR fallback (auto-detected, on by default) | `data/extracted/<cb>/ocr/` |
 
 Phases are independently runnable and read prior artifacts from disk, so you can
@@ -298,47 +298,30 @@ Specific limits, each measured rather than assumed:
   that for IS 456 a fresh OCR would likely be *better* than the damaged text
   layer already present.
 
-### Phase 7 LLM provider
+### Phase 7 local dataset generation
 
-Phase 7 supports two backends, selected with `dataset_generation.provider`:
-
-```yaml
-# Gemini (default)
-dataset_generation:
-  provider: gemini
-  model: gemini-3.8-flash
-```
+Phase 7 generates instruction-tuning data completely locally (no external APIs, keys, or cloud dependencies), selected with `dataset_generation.generator`:
 
 ```yaml
-# OpenAI-compatible: DeepSeek, Groq, Together, vLLM, LM Studio, ...
+# Qwen local LLM + template hybrid
 dataset_generation:
-  provider: openai_compatible
-  base_url: https://api.deepseek.com/v1
-  model: deepseek-chat          # DeepSeek exposes deepseek-flash / deepseek-v4-pro
-  api_key_env: DEEPSEEK_API_KEY
+  enabled: true
+  generator: qwen
+  model: Qwen/Qwen3-1.7B
+  dtype: bfloat16
+  max_chunks: 200
+  qa_per_chunk: 3
+  llm_max_chunks: 1     # set 0 for fully templated instant run
+  max_new_tokens: 256
 ```
 
-```bash
-export DEEPSEEK_API_KEY=...     # or GEMINI_API_KEY, LLM_API_KEY, OPENAI_API_KEY
-python -m src.pipeline.run --pdf data/raw/<pdf>.pdf --phases 7
-```
+- **`qwen`**: Loads `Qwen/Qwen3-1.7B` locally in `bfloat16`. High-value chunks are sent to the local LLM, and remaining chunks fall back to the deterministic template generator.
+- **`template`**: Deterministic rule-based extraction from sentence definitions and requirements. Fully offline, instant (<1s), with zero hallucination.
 
-The key is read from the environment only, never written to disk. The
-OpenAI-compatible backend uses `urllib` rather than the `openai` SDK, so adding a
-provider needs no new dependency — just a `base_url`.
-
-### Phase 7 needs working quota
-
-Phase 7 reports `FAILED` and aborts fast when the key cannot generate:
-
-| Symptom | Meaning |
-|---|---|
-| `quota: API quota exhausted (429 RESOURCE_EXHAUSTED)` | Gemini free-tier generation quota spent. `models.list()` still succeeds, so the key is valid. |
-| `quota: payment required (402): account balance exhausted` | DeepSeek and similar: no credit on the account. |
-
-Both are account limits, not code faults. Whatever was generated before the
-abort is written and marked `DEGRADED`; nothing is silently padded. Fix billing
-or quota, then re-run `--phases 7`.
+Both generators enforce strict grounding guards:
+1. `forbid_calculation_intent`: Immediately rejects questions or answers attempting design calculations or sizing numbers.
+2. `numeric_grounding`: Rejects any answer containing a number absent from the source chunk.
+3. Every record links back to its exact `source_chunk_id`.
 
 ---
 

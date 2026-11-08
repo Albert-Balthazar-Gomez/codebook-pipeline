@@ -20,9 +20,13 @@ both rankings are fused with Reciprocal Rank Fusion.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 from ..common.config import Config
 from ..common.status import PhaseResult, Status
